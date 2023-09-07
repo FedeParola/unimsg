@@ -4,6 +4,7 @@
 
 #include <fcntl.h>
 #include <getopt.h>
+#include <linux/limits.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -21,6 +22,44 @@
 #define DEFAULT_SHM_SIZE	 (8 * 1024 * 1024)
 #define SERVER_LISTEN_BACKLOG	 10
 #define IVSHMEM_PROTOCOL_VERSION 0
+#define SIDECAR_MAX_FILTERS 	 16
+#define SIDECAR_SHM_PATH 	 "/unimsg_sidecar_%u"
+
+enum sidecar_verdict {
+	SIDECAR_OK,
+	SIDECAR_DROP,
+};
+
+enum sidecar_filter {
+	SIDECAR_FILTER_END,
+	REQUEST_LOG_HANDLER,
+	HTTP_SPAN_MIDDLEWARE,
+	REQUEST_METRIC_HANDLER,
+	NEW_TIMEOUT_HANDLER,
+	FORWARD_SHIM_HANDLER,
+	PROXY_HANDLER,
+	REQUEST_APP_METRIC_HANDLER,
+	CONCURRENCY_STATE_HANDLER,
+	SIDECAR_FILTER_MAX,
+};
+
+struct sidecar_config {
+	int rx_filetrs_chain[SIDECAR_MAX_FILTERS];
+	int tx_filetrs_chain[SIDECAR_MAX_FILTERS];
+};
+
+struct sidecar_stats {
+	unsigned long request_count;
+	unsigned long response_time_ms;
+	unsigned long app_request_count;
+	unsigned long app_response_time_ms;
+	unsigned long queue_depth;
+};
+
+struct sidecar_shm {
+	struct sidecar_config config;
+	struct sidecar_stats stats;
+};
 
 struct vm_info {
 	int id;
@@ -29,6 +68,7 @@ struct vm_info {
 };
 
 struct vm_info vms[UNIMSG_MAX_VMS];
+struct sidecar_shm *sidecar_shms[UNIMSG_MAX_VMS];
 static int sock_fd;
 static int shm_fd;
 static volatile int running = 1;
@@ -89,6 +129,11 @@ static void ivshmem_server_free_peer(int id)
 	close(vms[id].sock_fd);
 	close(vms[id].event_fd);
 	vms[id].id = -1;
+
+	if (sidecar_shms[id]) {
+		munmap(sidecar_shms[id], sizeof(*sidecar_shms[id]));
+		sidecar_shms[id] = NULL;
+	}
 
 	printf("Peer %d unregistered\n", id);
 }
@@ -339,6 +384,52 @@ void shm_init(struct unimsg_shm *shm)
 		unimsg_ring_enqueue(&shm->shm_pool.r, &i, 1);
 }
 
+void init_sidecar_shm(unsigned id)
+{
+	char shm_path[PATH_MAX];
+	sprintf(shm_path, SIDECAR_SHM_PATH, id);
+
+	int shm_fd = shm_open(shm_path, O_RDWR, S_IRWXU);
+	if (shm_fd < 0)
+		SYSERROR("Error opening sidecar shared memory");
+
+	struct sidecar_shm *shm =
+		(struct sidecar_shm *)mmap(0, sizeof(*shm),
+					   PROT_READ | PROT_WRITE, MAP_SHARED,
+					   shm_fd, 0);
+	if (!shm)
+		SYSERROR("Error mapping sidecar shared memory");
+
+	sidecar_shms[id] = shm;
+
+	close(shm_fd);
+}
+
+static void scrape_sidecar_stats()
+{
+	struct sidecar_shm *shm;
+
+	printf("Sidecar stats:\n");
+	for (int id = 1; id < UNIMSG_MAX_VMS; id++) {
+		if (vms[id].id == -1)
+			continue;
+
+		if (!sidecar_shms[id])
+			init_sidecar_shm(id);
+
+		shm =sidecar_shms[id];
+
+		printf("%u: request count = %lu, response time ms = %lu, "
+		       "app request count = %lu, app response time ms = %lu, "
+		       "queue depth = %lu\n", id, shm->stats.request_count,
+		       shm->stats.response_time_ms,
+		       shm->stats.app_request_count,
+		       shm->stats.app_response_time_ms, shm->stats.queue_depth);
+	}
+
+	printf("\n");
+}
+
 int main(int argc, char *argv[])
 {
 	parse_command_line(argc, argv);
@@ -366,7 +457,7 @@ int main(int argc, char *argv[])
 		vms[i].id = -1;
 
 	/* Setup AF_UNIX socket */
-
+	unlink(DEFAULT_UNIX_SOCK_PATH);
 	sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock_fd < 0)
 		SYSERROR("Error creating socket");
@@ -395,15 +486,7 @@ int main(int argc, char *argv[])
 	printf("Unimsg manager running, hit Ctrl+C to stop\n");
 	while(running) {
 		sleep(1);
-		// if (vms[0].id != -1) {
-		// 	unsigned long val = 1;
-		// 	if (write(vms[0].event_fd, &val, sizeof(val))
-		// 	    != sizeof(val))
-		// 		fprintf(stderr, "Error sending event to peer "
-		// 			"0: %s", strerror(errno));
-		// 	else
-		// 		printf("Sent event to peer 0\n");
-		// }
+		scrape_sidecar_stats();
 	}
 
 	pthread_join(events_poll_thread, NULL);	
