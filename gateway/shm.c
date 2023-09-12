@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include "shm.h"
 
+#define UNIMSG_BUFFER_HEADROOM 128
+
 static struct unimsg_ring *pool;
 static void *buffers;
 
@@ -16,7 +18,7 @@ void shm_init(struct unimsg_shm *control_shm, void *buffers_shm)
 
 void *unimsg_buffer_get_addr(struct unimsg_shm_desc *desc)
 {
-	return desc->idx * UNIMSG_BUFFER_SIZE + (void *)buffers;
+	return desc->idx * UNIMSG_BUFFER_SIZE + (void *)buffers + desc->off;
 }
 
 int unimsg_buffer_get(struct unimsg_shm_desc *descs, unsigned ndescs)
@@ -30,9 +32,10 @@ int unimsg_buffer_get(struct unimsg_shm_desc *descs, unsigned ndescs)
 	if (unimsg_ring_dequeue(pool, idx, ndescs))
 		return -ENOMEM;
 	for (unsigned i = 0; i < ndescs; i++) {
-		descs[i].addr = buffers + UNIMSG_BUFFER_SIZE * idx[i];
-		descs[i].size = UNIMSG_BUFFER_SIZE;
+		descs[i].size = UNIMSG_BUFFER_SIZE - UNIMSG_BUFFER_HEADROOM;
+		descs[i].off = UNIMSG_BUFFER_HEADROOM;
 		descs[i].idx = idx[i];
+		descs[i].addr = unimsg_buffer_get_addr(&descs[i]);
 	}
 
 	return 0;
