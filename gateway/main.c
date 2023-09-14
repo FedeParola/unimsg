@@ -374,7 +374,6 @@ int loop(void *arg)
 		if (event.flags & EV_EOF) {
 			/* Simply close socket */
 			ff_close(clientfd);
-
 			/* close the uniserver connection */
 			struct conn *c = get_clientfd(fd_map, clientfd);
 			conn_close(c, CONN_SIDE_SRV);
@@ -439,6 +438,7 @@ int loop(void *arg)
 
 			printf("Received %ld B from remote endpoint:\n",
 			       readlen);
+			printf("idx is %d\n", desc.idx);
 			print_msg(msg, desc.size);
 			printf("\n");
 
@@ -449,6 +449,7 @@ int loop(void *arg)
 					/* TODO: handle peer closing
 					 * connection
 					 */
+					ff_close(clientfd);
 					unimsg_buffer_put(&desc, 1);
 				} else if (rc == -EAGAIN) {
 					/* The ring is full, we drop the packet
@@ -480,6 +481,8 @@ int loop(void *arg)
 		if (rc) {
 			if (rc == -ECONNRESET) {
 				/* TODO: handle peer closing connection	*/
+				ff_close(fd_map[i].hostfd);
+				continue;
 			} else if (rc == -EAGAIN) {
 				/* If rc == -EAGAIN the peer has nothing to send
 				 * and we can proceed with the next iteration of
