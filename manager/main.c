@@ -338,6 +338,8 @@ void shm_init(struct unimsg_shm *shm)
 	shm->rt.routes[1].peer_id = 1;
 	shm->rt.routes[2].addr = 0x0200000a; /* 10.0.0.2 */
 	shm->rt.routes[2].peer_id = 2;
+	shm->rt.routes[3].addr = 0x0300000a; /* 10.0.0.3 */
+	shm->rt.routes[3].peer_id = 3;
 
 	/* Initialize signals */
 	for (int i = 0; i < UNIMSG_MAX_VMS; i++) {

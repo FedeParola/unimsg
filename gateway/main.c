@@ -32,6 +32,8 @@
 #define MGR_SOCK_PATH "/tmp/ivshmem_socket"
 #define CONTROL_SHM_SIZE (sizeof(struct unimsg_shm))
 #define DEFAULT_SIZE 64 
+#define RAND_UPPER_LIMIT 2
+#define RAND_LOWER_LIMIT 0
 
 extern struct unimsg_ring *rte_mempool_unimsg_ring;
 static int peers_fds[UNIMSG_MAX_VMS];
@@ -49,6 +51,18 @@ struct kevent events[MAX_EVENTS];
 static int opt_size = DEFAULT_SIZE;
 #define NB_SOCKETS 8
 extern struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
+
+/* Setup Connection to multiple applications 
+running on different port with own identity*/
+struct app_ident{
+	uint32_t adr; 
+	uint16_t port;
+}; 
+struct app_ident app_idents[RAND_UPPER_LIMIT + 1] = {
+    { .adr = 1, .port = 5000 },
+    { .adr = 2, .port = 6000 }, 
+	{ .adr = 3, .port = 7000 },
+};
 
 /* Cached mempool infos */
 static unsigned long mp_base_addr;
@@ -223,6 +237,7 @@ static int connect_to_peer(uint32_t addr, uint16_t port, struct conn **c)
 	/* TODO: replace with hash lookup */
 	unsigned peer_id =
 		control_shm->rt.routes[addr % UNIMSG_RT_SIZE].peer_id;
+	printf("Peer id: %u\n", peer_id);
 	if (!peer_id)
 		return -ENETUNREACH;
 
@@ -377,8 +392,8 @@ int loop(void *arg)
 			/* close the uniserver connection */
 			struct conn *c = get_clientfd(fd_map, clientfd);
 			conn_close(c, CONN_SIDE_SRV);
-			printf("Connection closed\n");
-
+			/* remove the pair from the map */
+			remove_fd_pair(fd_map, clientfd);
 		} else if (clientfd == sockfd) {
 			int available = (int)event.data;
 			do {
@@ -401,10 +416,12 @@ int loop(void *arg)
 				}
 
 				available--;
-
+				/* Random selection of radiobox server*/
+				int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
+				printf("rd = %d\n", rd);
 				/* Initiate connection to radiobox server */ 
 				struct conn *cn; 
-				int ret = connect_to_peer(1, 5000, &cn);
+				int ret = connect_to_peer(app_idents[rd].adr, app_idents[rd].port, &cn);
 				if (ret)
 					ERROR("connect_to_peer failed: %s\n",
 					       strerror(-ret));
@@ -436,20 +453,12 @@ int loop(void *arg)
 			desc.size = readlen;
 			buffer_get_offset(&desc);
 
-			printf("Received %ld B from remote endpoint:\n",
-			       readlen);
-			printf("idx is %d\n", desc.idx);
-			print_msg(msg, desc.size);
-			printf("\n");
-
 			/* Handle single descriptor for now */
 			int rc = conn_send(c, &desc, 1, CONN_SIDE_CLI);
 			if (rc) {
 				if (rc == -ECONNRESET) {
-					/* TODO: handle peer closing
-					 * connection
-					 */
 					ff_close(clientfd);
+					remove_fd_pair(fd_map, clientfd);
 					unimsg_buffer_put(&desc, 1);
 				} else if (rc == -EAGAIN) {
 					/* The ring is full, we drop the packet
@@ -480,8 +489,8 @@ int loop(void *arg)
 		rc = conn_recv(c, &desc, &ndescs, CONN_SIDE_CLI);
 		if (rc) {
 			if (rc == -ECONNRESET) {
-				/* TODO: handle peer closing connection	*/
 				ff_close(fd_map[i].hostfd);
+				remove_fd_pair(fd_map, fd_map[i].hostfd);
 				continue;
 			} else if (rc == -EAGAIN) {
 				/* If rc == -EAGAIN the peer has nothing to send
@@ -498,10 +507,6 @@ int loop(void *arg)
 
 		char *msg = buffer_get_addr(&desc);
 		
-		printf("Received %u B from local endpoint:\n", desc.size);
-		print_msg(msg, desc.size);
-		printf("\n");
-
 		/* Need to get the rte_mbuf corresponding to the buffer */
 		struct rte_mbuf *m = get_rte_mb_from_buffer(&desc);
 		if (!m)
