@@ -58,10 +58,10 @@ struct app_ident{
 	uint32_t adr; 
 	uint16_t port;
 }; 
-struct app_ident app_idents[RAND_UPPER_LIMIT + 1] = {
+struct app_ident app_idents[1] = {
     { .adr = 1, .port = 5000 },
-    { .adr = 2, .port = 6000 }, 
-	{ .adr = 3, .port = 7000 },
+    // { .adr = 2, .port = 6000 }, 
+	// { .adr = 3, .port = 7000 },
 };
 
 /* Cached mempool infos */
@@ -237,7 +237,6 @@ static int connect_to_peer(uint32_t addr, uint16_t port, struct conn **c)
 	/* TODO: replace with hash lookup */
 	unsigned peer_id =
 		control_shm->rt.routes[addr % UNIMSG_RT_SIZE].peer_id;
-	printf("Peer id: %u\n", peer_id);
 	if (!peer_id)
 		return -ENETUNREACH;
 
@@ -417,15 +416,15 @@ int loop(void *arg)
 
 				available--;
 				/* Random selection of radiobox server*/
-				int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
-				printf("rd = %d\n", rd);
+				// int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
 				/* Initiate connection to radiobox server */ 
 				struct conn *cn; 
-				int ret = connect_to_peer(app_idents[rd].adr, app_idents[rd].port, &cn);
-				if (ret)
+				int ret = connect_to_peer(app_idents[0].adr, app_idents[0].port, &cn);
+				if (ret){
 					ERROR("connect_to_peer failed: %s\n",
 					       strerror(-ret));
-
+						   continue;
+				}	
 				/* Add the pair to the map */
 				add_fd_pair(fd_map, nclientfd, cn);
 
