@@ -58,12 +58,12 @@ struct app_ident{
 	uint32_t adr; 
 	uint16_t port;
 }; 
-struct app_ident app_idents[3] = {
+struct app_ident app_idents[1] = {
     { .adr = 1, .port = 5000 },
-    { .adr = 2, .port = 6000 }, 
-	{ .adr = 3, .port = 7000 },
+    // { .adr = 2, .port = 6000 }, 
+	// { .adr = 3, .port = 7000 },
 };
-
+char* html[2048];
 /* Cached mempool infos */
 static unsigned long mp_base_addr;
 static size_t mp_tot_esize;
@@ -416,7 +416,8 @@ int loop(void *arg)
 
 				available--;
 				/* Random selection of radiobox server*/
-				int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
+				// int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
+				int rd = 0 ;
 				/* Initiate connection to radiobox server */ 
 				struct conn *cn; 
 				int ret = connect_to_peer(app_idents[rd].adr, app_idents[rd].port, &cn);
@@ -431,41 +432,32 @@ int loop(void *arg)
 			} while (available);
 
 		} else if (event.filter == EVFILT_READ) {
-			void *mb = NULL;
-			ssize_t readlen = ff_read(clientfd, &mb, 4096);
-			struct rte_mbuf *rte_mb = ff_rte_frm_extcl(mb);
-			/* get the data from the mb freebsd buf*/
-			char *msg = (char *)ff_mbuf_mtod(mb);
-			ff_mbuf_detach_rte(mb);
-			ff_mbuf_free(mb);
-
+            char buf[256];
+            ssize_t readlen = ff_read(clientfd, buf, sizeof(buf));
 			struct conn *c = get_clientfd(fd_map, clientfd);
 			if (c == NULL){ 
 				printf("get_clientfd failed:%d, %s\n", errno,
 				strerror(errno));
 				return -1;
 			}
-
-			struct unimsg_shm_desc desc;
-			desc.addr = msg;
-			desc.idx = buffer_get_idx(msg);
-			desc.size = readlen;
-			buffer_get_offset(&desc);
-
+			struct unimsg_shm_desc descs;
+			unsigned ndescs = 1;
+			unimsg_buffer_get(&descs, ndescs);
+			memcpy(buffer_get_addr(&descs), buf, readlen);
 			/* Handle single descriptor for now */
-			int rc = conn_send(c, &desc, 1, CONN_SIDE_CLI);
+			int rc = conn_send(c, &descs, 1, CONN_SIDE_CLI);
 			if (rc) {
 				if (rc == -ECONNRESET) {
 					ff_close(clientfd);
 					remove_fd_pair(fd_map, clientfd);
-					unimsg_buffer_put(&desc, 1);
+					unimsg_buffer_put(&descs, 1);
 				} else if (rc == -EAGAIN) {
 					/* The ring is full, we drop the packet
 					 * and let TCP handle retransmission
 					 */
-					unimsg_buffer_put(&desc, 1);
+					unimsg_buffer_put(&descs, 1);
 				} else {
-					unimsg_buffer_put(&desc, 1);
+					unimsg_buffer_put(&descs, 1);
 					ERROR("Error sending desc: %s\n",
 					      strerror(-rc));
 				}
@@ -505,19 +497,11 @@ int loop(void *arg)
 		}
 
 		char *msg = buffer_get_addr(&desc);
-		
-		/* Need to get the rte_mbuf corresponding to the buffer */
-		struct rte_mbuf *m = get_rte_mb_from_buffer(&desc);
-		if (!m)
-			ERROR("Cannot map shm buffer to rte_mbuf\n");
-
-		/* Get a new freebsd mbuf with ext_arg set as the rte_mbuf */
-		void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg, m->data_len);
-
-		/* Write the bsd_mbuf to the socket
-		 * TODO: handle failure with backpressure
-		 */
-		ff_write(fd_map[i].hostfd, bsd_mbuf, m->data_len);
+		unsigned length = desc.size;
+		memcpy(html, msg, length);
+		/* Write to the socket */
+		ff_write(fd_map[i].hostfd,html,(size_t)length);
+		unimsg_buffer_put(&desc, 1);
 	}
 }
 
@@ -550,7 +534,7 @@ void gateway_start(){
 	if (ff_bind(sockfd, (struct linux_sockaddr *)&my_addr, sizeof(my_addr)) < 0)
 		SYSERROR("Error binding socket");
 
-	if (ff_listen(sockfd, MAX_EVENTS) < 0)
+	if (ff_listen(sockfd, 4096) < 0)
 		SYSERROR("Error listening socket");
 
 	EV_SET(&kevSet, sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
@@ -564,12 +548,11 @@ int main(int argc, char *argv[])
 	control_shm = setup_manager_connection();
 	buffers_shm = get_buffers_shm();
 
-	/* Configure the ring for the rte mempool */
-	/* TODO: this is awful, find a best API to set the ring */
-	rte_mempool_unimsg_ring = &control_shm->shm_pool.r;
+	// /* Configure the ring for the rte mempool */
+	// /* TODO: this is awful, find a best API to set the ring */
+	// rte_mempool_unimsg_ring = &control_shm->shm_pool.r;
 
-	ff_init(argc, argv, buffers_shm, UNIMSG_BUFFERS_COUNT,
-		UNIMSG_BUFFER_SIZE);
+	ff_init(argc, argv);
 
 	cache_mempool_infos();
 	
