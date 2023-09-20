@@ -432,18 +432,18 @@ int loop(void *arg)
 			} while (available);
 
 		} else if (event.filter == EVFILT_READ) {
-            char buf[256];
-            ssize_t readlen = ff_read(clientfd, buf, sizeof(buf));
+			struct unimsg_shm_desc descs;
+			unsigned ndescs = 1;
+			unimsg_buffer_get(&descs, ndescs);
+			descs.size = 1024;
+            ssize_t readlen = ff_read(clientfd, descs.addr, (size_t)descs.size);
 			struct conn *c = get_clientfd(fd_map, clientfd);
 			if (c == NULL){ 
 				printf("get_clientfd failed:%d, %s\n", errno,
 				strerror(errno));
 				return -1;
 			}
-			struct unimsg_shm_desc descs;
-			unsigned ndescs = 1;
-			unimsg_buffer_get(&descs, ndescs);
-			memcpy(buffer_get_addr(&descs), buf, readlen);
+
 			/* Handle single descriptor for now */
 			int rc = conn_send(c, &descs, 1, CONN_SIDE_CLI);
 			if (rc) {
@@ -498,9 +498,8 @@ int loop(void *arg)
 
 		char *msg = buffer_get_addr(&desc);
 		unsigned length = desc.size;
-		memcpy(html, msg, length);
 		/* Write to the socket */
-		ff_write(fd_map[i].hostfd,html,(size_t)length);
+		ff_write(fd_map[i].hostfd, msg, (size_t)length);
 		unimsg_buffer_put(&desc, 1);
 	}
 }

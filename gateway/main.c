@@ -58,10 +58,10 @@ struct app_ident{
 	uint32_t adr; 
 	uint16_t port;
 }; 
-struct app_ident app_idents[3] = {
+struct app_ident app_idents[1] = {
     { .adr = 1, .port = 5000 },
-    { .adr = 2, .port = 6000 }, 
-	{ .adr = 3, .port = 7000 },
+    // { .adr = 2, .port = 6000 }, 
+	// { .adr = 3, .port = 7000 },
 };
 
 /* Cached mempool infos */
@@ -416,7 +416,8 @@ int loop(void *arg)
 
 				available--;
 				/* Random selection of radiobox server*/
-				int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
+				// int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
+				int rd = 0;
 				/* Initiate connection to radiobox server */ 
 				struct conn *cn; 
 				int ret = connect_to_peer(app_idents[rd].adr, app_idents[rd].port, &cn);
