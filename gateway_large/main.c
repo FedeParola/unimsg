@@ -336,6 +336,10 @@ static unsigned buffer_get_offset(struct unimsg_shm_desc *desc)
 	return desc->off;
 }
 
+static void *buffer_get_header(struct unimsg_shm_desc *desc){
+	desc->addr = buffers_shm + UNIMSG_BUFFER_SIZE * desc->idx;
+	return desc->addr;
+}
 static void cache_mempool_infos()
 {
 	mp = pktmbuf_pool[rte_socket_id()];
@@ -362,7 +366,7 @@ static struct rte_mbuf *get_rte_mb_from_buffer(struct unimsg_shm_desc *desc)
 	return mb;
 }
 
-static struct rte_mbuf *get_new_rte_mbuf(struct unimsg_shm_desc *desc, unsigned data_size){
+static struct rte_mbuf *get_new_rte_mbuf(unsigned data_size, void *buffer_header){
 
 	struct rte_mbuf *mb = rte_pktmbuf_alloc(mp);
 	if (!mb)
@@ -370,8 +374,7 @@ static struct rte_mbuf *get_new_rte_mbuf(struct unimsg_shm_desc *desc, unsigned 
 	    printf("Cannot allocate mbuf.\n");
 	    return NULL;
     }
-
-	mb->data_off = desc->off;
+	mb->buf_addr = buffer_header;
 	mb->data_len = data_size;
 	mb->pkt_len = mb->data_len;
 
@@ -448,14 +451,14 @@ int loop(void *arg)
 			} while (available);
 
 		} else if (event.filter == EVFILT_READ) {
-			void *mb = NULL;
+			void *mb;
 			ssize_t readlen = ff_read(clientfd, &mb, 4096);
-			// struct rte_mbuf *rte_mb = ff_rte_frm_extcl(mb);
+
 			/* get the data from the mb freebsd buf*/
 			char *msg = (char *)ff_mbuf_mtod(mb);
+
 			/* Just free the mb, both rte and freebsd mbufs are freed*/
-			// ff_mbuf_detach_rte(mb);
-			// ff_mbuf_free(mb);w
+			ff_mbuf_free(mb);
 
 			struct conn *c = get_clientfd(fd_map, clientfd);
 			if (c == NULL){ 
@@ -522,27 +525,34 @@ int loop(void *arg)
 			}
 		}
 
-		char *msg = buffer_get_addr(&desc);
+		// char *msg = buffer_get_addr(&desc);
+		void *buff_address = buffer_get_header(&desc);
+		unsigned offset = desc.off; 
 		
 		unsigned num_of_rte_mbuf = (desc.size + 1023) / 1024;
 		unsigned total_data_size = desc.size;
 
-		for (unsigned i = 0 ; i < num_of_rte_mbuf ; i++){
-			
+		for (unsigned j = 0 ; j < num_of_rte_mbuf ; j++){
 			unsigned data_size = (total_data_size > 1024) ? 1024 : total_data_size;
-			total_data_size -= data_size;
+			printf("data_size = %d\n", data_size);
 			/* Need to get the rte_mbuf corresponding to the buffer */
-			struct rte_mbuf *m = get_new_rte_mbuf(&desc, data_size);
+			struct rte_mbuf *m = get_new_rte_mbuf(data_size, buff_address);
 			if (!m)
 				ERROR("Cannot map shm buffer to rte_mbuf\n");
-
+			m->data_off = offset;
+			char *data = rte_pktmbuf_mtod_offset(m, char *, 0);
+			print_msg(data, data_size);
 			/* Get a new freebsd mbuf with ext_arg set as the rte_mbuf */
-			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg, m->data_len);
+			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, (void *)data, data_size);
 
 			/* Write the bsd_mbuf to the socket
 			* TODO: handle failure with backpressure
 			*/
-			ff_write(fd_map[i].hostfd, bsd_mbuf, m->data_len);
+			ff_write(fd_map[i].hostfd, bsd_mbuf, data_size);
+
+			total_data_size -= data_size;
+			buff_address += data_size;
+			
 		}
 	}
 }
