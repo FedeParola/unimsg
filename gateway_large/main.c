@@ -366,7 +366,7 @@ static struct rte_mbuf *get_rte_mb_from_buffer(struct unimsg_shm_desc *desc)
 	return mb;
 }
 
-static struct rte_mbuf *get_new_rte_mbuf(unsigned data_size, void *buffer_header){
+static struct rte_mbuf *get_new_rte_mbuf(unsigned data_size, void *buffer_header, unsigned offset){
 
 	struct rte_mbuf *mb = rte_pktmbuf_alloc(mp);
 	if (!mb)
@@ -377,7 +377,7 @@ static struct rte_mbuf *get_new_rte_mbuf(unsigned data_size, void *buffer_header
 	mb->buf_addr = buffer_header;
 	mb->data_len = data_size;
 	mb->pkt_len = mb->data_len;
-
+	mb->data_off = (uint16_t) offset;
 	return mb;
 }
 
@@ -503,10 +503,10 @@ int loop(void *arg)
 
 		/* Read from the connection */
 		struct conn *c = fd_map[i].connection;
-		struct unimsg_shm_desc desc;
-		unsigned ndescs = 1;
+		struct unimsg_shm_desc desc[UNIMSG_MAX_DESCS_BULK];
+		unsigned ndescs;
 		int rc;
-		rc = conn_recv(c, &desc, &ndescs, CONN_SIDE_CLI);
+		rc = conn_recv(c, desc, &ndescs, CONN_SIDE_CLI);
 		if (rc) {
 			if (rc == -ECONNRESET) {
 				ff_close(fd_map[i].hostfd);
@@ -519,41 +519,24 @@ int loop(void *arg)
 				 */
 				continue;
 			} else {
-				unimsg_buffer_put(&desc, 1);
+				unimsg_buffer_put(desc, ndescs);
 				ERROR("Error sending desc: %s\n",
 				      strerror(-rc));
 			}
 		}
-
-		// char *msg = buffer_get_addr(&desc);
-		void *buff_address = buffer_get_header(&desc);
-		unsigned offset = desc.off; 
-		
-		unsigned num_of_rte_mbuf = (desc.size + 1023) / 1024;
-		unsigned total_data_size = desc.size;
-
-		for (unsigned j = 0 ; j < num_of_rte_mbuf ; j++){
-			unsigned data_size = (total_data_size > 1024) ? 1024 : total_data_size;
-			printf("data_size = %d\n", data_size);
-			/* Need to get the rte_mbuf corresponding to the buffer */
-			struct rte_mbuf *m = get_new_rte_mbuf(data_size, buff_address);
+		for (unsigned k = 0 ; k < ndescs ; k++){
+			// char *msg = buffer_get_addr(&desc[k]);
+			void *buffer = buffer_get_header(&desc[k]);
+			unsigned offset = desc[k].off;
+			unsigned data_size = desc[k].size;
+			struct rte_mbuf *m = get_new_rte_mbuf(data_size, buffer, offset); 
 			if (!m)
 				ERROR("Cannot map shm buffer to rte_mbuf\n");
-			m->data_off = offset;
-			char *data = rte_pktmbuf_mtod_offset(m, char *, 0);
-			print_msg(data, data_size);
-			/* Get a new freebsd mbuf with ext_arg set as the rte_mbuf */
-			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, (void *)data, data_size);
-
-			/* Write the bsd_mbuf to the socket
-			* TODO: handle failure with backpressure
-			*/
+			void *data = rte_pktmbuf_mtod_offset(m, void *, 0);
+			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, data, data_size);
 			ff_write(fd_map[i].hostfd, bsd_mbuf, data_size);
-
-			total_data_size -= data_size;
-			buff_address += data_size;
-			
 		}
+
 	}
 }
 

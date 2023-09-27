@@ -11,7 +11,7 @@
 
 #define UNIMSG_BUFFERS_PATH "/dev/hugepages/unimsg_buffers"
 #define UNIMSG_MAX_VMS 16
-#define PAGE_SIZE (1024)
+#define PAGE_SIZE (4 * 1024)
 #define UNIMSG_BUFFER_SIZE PAGE_SIZE
 #define UNIMSG_BUFFERS_COUNT 1024
 #define SIGNAL_QUEUE_SIZE 256
