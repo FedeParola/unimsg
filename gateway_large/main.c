@@ -456,8 +456,7 @@ int loop(void *arg)
 
 			/* get the data from the mb freebsd buf*/
 			char *msg = (char *)ff_mbuf_mtod(mb);
-
-			/* Just free the mb, both rte and freebsd mbufs are freed*/
+			ff_mbuf_detach_rte(mb);
 			ff_mbuf_free(mb);
 
 			struct conn *c = get_clientfd(fd_map, clientfd);
@@ -524,17 +523,16 @@ int loop(void *arg)
 				      strerror(-rc));
 			}
 		}
+		printf("ndescs %d\n", ndescs);
 		for (unsigned k = 0 ; k < ndescs ; k++){
-			// char *msg = buffer_get_addr(&desc[k]);
-			void *buffer = buffer_get_header(&desc[k]);
-			unsigned offset = desc[k].off;
-			unsigned data_size = desc[k].size;
-			struct rte_mbuf *m = get_new_rte_mbuf(data_size, buffer, offset); 
+			char *msg = buffer_get_addr(&desc[k]);
+
+			struct rte_mbuf *m = get_rte_mb_from_buffer(&desc[k]);
 			if (!m)
 				ERROR("Cannot map shm buffer to rte_mbuf\n");
-			void *data = rte_pktmbuf_mtod_offset(m, void *, 0);
-			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, data, data_size);
-			ff_write(fd_map[i].hostfd, bsd_mbuf, data_size);
+			printf("m->datalen: %d\n", m->data_len);
+			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg, m->data_len);
+			ff_write(fd_map[i].hostfd, bsd_mbuf, m->data_len);
 		}
 
 	}
