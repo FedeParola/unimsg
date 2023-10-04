@@ -12,7 +12,7 @@ struct fd_pair
     struct conn *connection;
 };
 
-#define MAX_CONNECTIONS 10
+#define MAX_CONNECTIONS 512
 extern struct fd_pair fd_map[MAX_CONNECTIONS];
 
 void initialize_fd_map();
