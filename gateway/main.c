@@ -374,11 +374,10 @@ int loop(void *arg)
 		if (event.flags & EV_EOF) {
 			/* Simply close socket */
 			ff_close(clientfd);
-
 			/* close the uniserver connection */
 			struct conn *c = get_clientfd(fd_map, clientfd);
-			conn_close(c, CONN_SIDE_SRV);
-			printf("Connection closed\n");
+			conn_close(c, CONN_SIDE_CLI);
+			remove_fd_pair(fd_map, clientfd);
 
 		} else if (clientfd == sockfd) {
 			int available = (int)event.data;
@@ -446,10 +445,10 @@ int loop(void *arg)
 			int rc = conn_send(c, &desc, 1, CONN_SIDE_CLI);
 			if (rc) {
 				if (rc == -ECONNRESET) {
-					/* TODO: handle peer closing
-					 * connection
-					 */
 					unimsg_buffer_put(&desc, 1);
+					ff_close(clientfd);
+					conn_close(c, CONN_SIDE_CLI);
+					remove_fd_pair(fd_map, clientfd);
 				} else if (rc == -EAGAIN) {
 					/* The ring is full, we drop the packet
 					 * and let TCP handle retransmission
@@ -479,7 +478,10 @@ int loop(void *arg)
 		rc = conn_recv(c, &desc, &ndescs, CONN_SIDE_CLI);
 		if (rc) {
 			if (rc == -ECONNRESET) {
-				/* TODO: handle peer closing connection	*/
+				ff_close(fd_map[i].hostfd);
+				conn_close(c, CONN_SIDE_CLI);
+				remove_fd_pair(fd_map, fd_map[i].hostfd);
+				continue;
 			} else if (rc == -EAGAIN) {
 				/* If rc == -EAGAIN the peer has nothing to send
 				 * and we can proceed with the next iteration of
