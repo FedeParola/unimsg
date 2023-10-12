@@ -34,6 +34,10 @@
 #define DEFAULT_SIZE 64 
 #define RAND_UPPER_LIMIT 2
 #define RAND_LOWER_LIMIT 0
+/* Max number of consecutive connections the gateway can accept from local
+ * hosts before moving to other tasks
+ */
+#define ACCEPT_BURST 8
 
 extern struct unimsg_ring *rte_mempool_unimsg_ring;
 static int peers_fds[UNIMSG_MAX_VMS];
@@ -272,48 +276,46 @@ err_release_ls:
 	return rc;
 }
 
-static int handle_peer_connection()
+static int accept_local_connection()
 {
 	int rc;
 	unsigned idx;
-	
+
 	rc = unimsg_ring_dequeue(&control_shm->gw_backlog.r, &idx, 1);
 	if (rc == -EAGAIN)
 		return rc;
 	if (rc)
-		ERROR("Error accepting connection: %s\n", strerror(-rc));
+		ERROR("Error accepting local  connection: %s\n", strerror(-rc));
 
 	struct conn *c = conn_from_idx(idx);
 
-	printf("Received connection from %u:%u to %u:%u\n", c->id.client_addr,
-	       c->id.client_port, c->id.server_addr, c->id.server_port);
+	int sockfd = ff_socket(AF_INET, SOCK_STREAM, 0);
+	if (sockfd < 0)
+		SYSERROR("Error creating socket");
 
-	/* Echo all messages until the peer closes the conection */
-	struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
-	unsigned ndescs;
-	for (;;) {
-		ndescs = UNIMSG_MAX_DESCS_BULK;
-		do
-			rc = conn_recv(c, descs, &ndescs, CONN_SIDE_SRV);
-		while (rc == -EAGAIN);
-		if (rc == -ECONNRESET)
-			break;
-		else if (rc)
-			ERROR("Error receiving desc: %s\n", strerror(-rc));
+	int on = 1;
+	if (ff_ioctl(sockfd, FIONBIO, &on) < 0)
+		SYSERROR("Error setting non blocking");
 
-		do
-			rc = conn_send(c, descs, ndescs, CONN_SIDE_SRV);
-		while (rc == -EAGAIN);
-		if (rc == -ECONNRESET) {
-			unimsg_buffer_put(descs, ndescs);
-			break;
-		} else if (rc) {
-			unimsg_buffer_put(descs, ndescs);
-			ERROR("Error sending desc: %s\n", strerror(-rc));
-		}
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(c->id.server_port);
+	addr.sin_addr.s_addr = htonl(c->id.server_addr);
+
+	/* Start connection establishment to remote peer */
+	if (ff_connect(sockfd, (struct linux_sockaddr *)&addr, sizeof(addr))
+	    < 0) {
+		if (errno != EINPROGRESS)
+			SYSERROR("Error connecting to remote host");
 	}
 
-	conn_close(c, CONN_SIDE_SRV);
+	/* A WRITE event notifies connection established */
+	struct kevent kev;
+	EV_SET(&kev, sockfd, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
+	if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+		SYSERROR("Error updating kevents");
+
+	add_fd_pair(fd_map, sockfd, c, CONN_SIDE_SRV, 0);
 
 	return 0;
 }
@@ -372,25 +374,19 @@ int loop(void *arg)
 {
 	/* Wait for events to happen */
 	int nevents = ff_kevent(kq, NULL, 0, events, MAX_EVENTS, NULL);
-	int i;
+	if (nevents < 0)
+		SYSERROR("Error waiting for events");
 
-	if (nevents < 0) {
-		printf("ff_kevent failed:%d, %s\n", errno,
-		strerror(errno));
-		return -1;
-	}
-
-	for (i = 0; i < nevents; ++i) {
+	for (int i = 0; i < nevents; ++i) {
 		struct kevent event = events[i];
 		int clientfd = (int)event.ident;
 
-		/* Handle disconnect */
 		if (event.flags & EV_EOF) {
-			/* Simply close socket */
+			/* Handle disconnect */
 			ff_close(clientfd);
-			/* close the uniserver connection */
-			struct conn *c = get_clientfd(fd_map, clientfd);
-			conn_close(c, CONN_SIDE_CLI);
+			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
+								    clientfd);
+			conn_close(pair->conn, pair->local_side);
 			remove_fd_pair(fd_map, clientfd);
 
 		} else if (clientfd == sockfd) {
@@ -419,17 +415,18 @@ int loop(void *arg)
 				// int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
 				int rd = 0;
 				/* Initiate connection to radiobox server */ 
-				struct conn *cn; 
+				struct conn *cn;
 				int ret = connect_to_peer(app_idents[rd].adr,
 							  app_idents[rd].port,
 							  &cn);
-				if (ret){
+				if (ret) {
 					ERROR("connect_to_peer failed: %s\n",
-					       strerror(-ret));
-						   continue;
+					      strerror(-ret));
+					continue;
 				}	
 				/* Add the pair to the map */
-				add_fd_pair(fd_map, nclientfd, cn);
+				add_fd_pair(fd_map, nclientfd, cn,
+					    CONN_SIDE_CLI, 1);
 
 			} while (available);
 
@@ -442,12 +439,10 @@ int loop(void *arg)
 			ff_mbuf_detach_rte(mb);
 			ff_mbuf_free(mb);
 
-			struct conn *c = get_clientfd(fd_map, clientfd);
-			if (c == NULL){ 
-				printf("get_clientfd failed:%d, %s\n", errno,
-				strerror(errno));
-				return -1;
-			}
+			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
+								    clientfd);
+			if (!pair)
+				ERROR("No connection found\n");
 
 			struct unimsg_shm_desc desc;
 			desc.addr = msg;
@@ -455,13 +450,14 @@ int loop(void *arg)
 			desc.size = readlen;
 			buffer_get_offset(&desc);
 
-			/* Handle single descriptor for now */
-			int rc = conn_send(c, &desc, 1, CONN_SIDE_CLI);
+			int rc = conn_send(pair->conn, &desc, 1,
+					   pair->local_side);
 			if (rc) {
 				if (rc == -ECONNRESET) {
 					unimsg_buffer_put(&desc, 1);
 					ff_close(clientfd);
-					conn_close(c, CONN_SIDE_CLI);
+					conn_close(pair->conn,
+						   pair->local_side);
 					remove_fd_pair(fd_map, clientfd);
 				} else if (rc == -EAGAIN) {
 					/* The ring is full, we drop the packet
@@ -475,25 +471,48 @@ int loop(void *arg)
 				}
 			}
 
+		} else if (event.filter == EVFILT_WRITE) {
+			/* Connection to remote host established */
+			struct kevent kevs[2];
+			EV_SET(&kevs[0], clientfd, EVFILT_WRITE, EV_DELETE, 0,
+			       0, NULL);
+			EV_SET(&kevs[1], clientfd, EVFILT_READ, EV_ADD, 0, 0,
+			       NULL);
+			if (ff_kevent(kq, kevs, 2, NULL, 0, NULL) < 0)
+				SYSERROR("Error updating kevents");
+
+			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
+								    clientfd);
+			if (!pair)
+				ERROR("No connection found");
+			pair->connected = 1;
+
 		} else {
 			printf("unknown event: %8.8X\n", event.flags);
 		}
 	}
 
-	for (int i = 0 ; i < MAX_CONNECTIONS ; i++ ){
-		if(fd_map[i].hostfd == -1 || !fd_map[i].connection)
+	/* Handle new connections from local hosts */
+	for (int i = 0; i < ACCEPT_BURST; i++) {
+		if (accept_local_connection())
+			break;
+	}
+
+	for (int i = 0; i < MAX_CONNECTIONS; i++) {
+		if (fd_map[i].hostfd == -1 || !fd_map[i].connected)
 			continue;
 
 		/* Read from the connection */
-		struct conn *c = fd_map[i].connection;
+		struct conn *c = fd_map[i].conn;
+		enum conn_side side = fd_map[i].local_side;
 		struct unimsg_shm_desc desc[UNIMSG_MAX_DESCS_BULK];
 		unsigned ndescs = UNIMSG_MAX_DESCS_BULK;
 		int rc;
-		rc = conn_recv(c, desc, &ndescs, CONN_SIDE_CLI);
+		rc = conn_recv(c, desc, &ndescs, side);
 		if (rc) {
 			if (rc == -ECONNRESET) {
 				ff_close(fd_map[i].hostfd);
-				conn_close(c, CONN_SIDE_CLI);
+				conn_close(c, side);
 				remove_fd_pair(fd_map, fd_map[i].hostfd);
 				continue;
 			} else if (rc == -EAGAIN) {
@@ -507,6 +526,7 @@ int loop(void *arg)
 				      strerror(-rc));
 			}
 		}
+
 		for (unsigned k = 0; k < ndescs; k++) {
 			char *msg = buffer_get_addr(&desc[k]);
 
@@ -515,7 +535,9 @@ int loop(void *arg)
 				ERROR("Cannot map shm buffer to rte_mbuf\n");
 			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg,
 						     m->data_len);
-			ff_write(fd_map[i].hostfd, bsd_mbuf, m->data_len);
+			if (ff_write(fd_map[i].hostfd, bsd_mbuf, m->data_len)
+			    < 0)
+				SYSERROR("Error sending msg to remote host");
 		}
 
 	}
@@ -526,7 +548,8 @@ static void sigint_handler(int signum)
 	stop = 1;
 }
 
-void gateway_start(){
+void gateway_start()
+{
 	/* f-stack configuration */
 	kq = ff_kqueue();
 	if (kq < 0)
@@ -547,7 +570,8 @@ void gateway_start(){
 	my_addr.sin_port = htons(80);
 	my_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	if (ff_bind(sockfd, (struct linux_sockaddr *)&my_addr, sizeof(my_addr)) < 0)
+	if (ff_bind(sockfd, (struct linux_sockaddr *)&my_addr, sizeof(my_addr))
+	    < 0)
 		SYSERROR("Error binding socket");
 
 	if (ff_listen(sockfd, MAX_EVENTS) < 0)
