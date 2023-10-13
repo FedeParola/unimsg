@@ -19,6 +19,7 @@ int listen_sock_lookup_acquire(uint32_t addr, uint16_t port,
 
 void listen_sock_release(struct listen_sock *s);
 
-int listen_sock_send_conn(struct listen_sock *s, struct conn *c);
+int listen_sock_send_conn(struct listen_sock *s, struct conn *c,
+			  unsigned peer_id);
 
 #endif /* __LIBUNIMSG_LISTENING_SOCK__ */

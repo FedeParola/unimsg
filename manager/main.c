@@ -15,6 +15,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 #include "../common/error.h"
+#include "../common/jhash.h"
 #include "../common/shm.h"
 
 #define DEFAULT_UNIX_SOCK_PATH	 "/tmp/ivshmem_socket"
@@ -61,13 +62,14 @@ struct sidecar_shm {
 	struct sidecar_stats stats;
 };
 
-struct vm_info {
+struct vm_data {
 	int id;
 	int sock_fd;
 	int event_fd;
 };
 
-struct vm_info vms[UNIMSG_MAX_VMS];
+static struct unimsg_shm *shm;
+struct vm_data vms[UNIMSG_MAX_VMS];
 struct sidecar_shm *sidecar_shms[UNIMSG_MAX_VMS];
 static int sock_fd;
 static int shm_fd;
@@ -78,6 +80,216 @@ static struct option long_options[] = {
 	{"threads", required_argument, 0, 't'},
 	{0, 0, 0, 0}
 };
+
+static void sigint_handler(int signum)
+{
+	running = 0;
+}
+
+static void usage(const char *prog)
+{
+	// ERROR("  Usage: %s [OPTIONS]\n"
+	//       "  Options:\n"
+	//       "  -b, --burst	Number of decriptors to send in a burst (default %d)\n"
+	//       "  -s, --sleep	Microseconds to sleep between consecutive transmissions (default %d)\n"
+	//       "  -t, --threads	Number of threads to use (default %d)\n",
+	//       prog, DEFAULT_BURST, DEFAULT_SLEEP, DEFAULT_THREADS);
+
+	exit(EXIT_FAILURE);
+}
+
+static void parse_command_line(int argc, char **argv)
+{
+	// int option_index, c;
+
+	// for (;;) {
+	// 	c = getopt_long(argc, argv, "b:s:t:", long_options, &option_index);
+	// 	if (c == -1) {
+	// 		break;
+	// 	}
+
+	// 	switch (c) {
+	// 	case 'b':
+	// 		opt_burst = atoi(optarg);
+	// 		break;
+	// 	case 's':
+	// 		opt_sleep = atoi(optarg);
+	// 		break;
+	// 	case 't':
+	// 		opt_threads = atoi(optarg);
+	// 		break;
+	// 	default:
+	// 		usage(argv[0]);
+	// 	}
+	// }
+}
+
+static void shm_init(struct unimsg_shm *shm)
+{
+	/* Fill the header */
+	shm->hdr.vms_info_off = (void *)&shm->vms_info - (void *)shm;
+	shm->hdr.vms_info_sz = UNIMSG_MAX_VMS;
+	shm->hdr.gw_backlog_off = (void *)&shm->gw_backlog - (void *)shm;
+	shm->hdr.signal_off = (void *)&shm->signal_queues - (void *)shm;
+	shm->hdr.signal_sz = sizeof(struct signal);
+	shm->hdr.listen_sock_map_off =
+		(void *)&shm->listen_sock_map - (void *)shm;
+	shm->hdr.listen_socks_off =
+		(void *)&shm->listen_sock_map.socks - (void *)shm;
+	shm->hdr.listen_sock_sz = sizeof(struct listen_sock);
+	shm->hdr.conn_pool_off = (void *)&shm->conn_pool - (void *)shm;
+	shm->hdr.conn_conns_off = (void *)&shm->conn_pool.conns - (void *)shm;
+	shm->hdr.conn_sz = sizeof(struct conn);
+	shm->hdr.conn_queue_sz = sizeof(struct sock_queue);
+	shm->hdr.shm_buffers_off = (void *)&shm->shm_pool - (void *)shm;
+
+	/* Initialize routing table */
+	for (unsigned i = 0; i < UNIMSG_MAX_VMS; i++)
+		shm->vms_info.rt_buckets[i] = UNIMSG_MAX_VMS;
+
+	/* Initialize GW backlog */
+	struct unimsg_ring *r = &shm->gw_backlog.r;
+	r->esize = sizeof(unsigned);
+	r->size = BACKLOG_QUEUE_SIZE;
+	r->flags = UNIMSG_RING_F_SC;
+
+	/* Initialize signals */
+	for (int i = 0; i < UNIMSG_MAX_VMS; i++) {
+		shm->signal_queues[i].r.esize = sizeof(struct signal);
+		shm->signal_queues[i].r.size = SIGNAL_QUEUE_SIZE;
+		shm->signal_queues[i].r.flags = UNIMSG_RING_F_SC;
+	}
+
+	/* Initialize listen sock */
+	shm->listen_sock_map.size = UNIMSG_MAX_LISTEN_SOCKS;
+	shm->listen_sock_map.freelist_head = 0;
+	for (int i = 0; i < UNIMSG_MAX_LISTEN_SOCKS; i++) {
+		struct unimsg_ring *r = &shm->listen_sock_map.socks[i].backlog;
+		r->esize = sizeof(unsigned);
+		r->size = BACKLOG_QUEUE_SIZE;
+		r->flags = UNIMSG_RING_F_SC;
+		shm->listen_sock_map.socks[i].freelist_next = i + 1;
+		shm->listen_sock_map.buckets[i].head = UNIMSG_MAX_LISTEN_SOCKS;
+	}
+
+	/* Initialize connections */
+	shm->conn_pool.r.esize = sizeof(unsigned);
+	shm->conn_pool.r.size = UNIMSG_MAX_CONNS;
+	shm->conn_pool.r.flags = 0;
+	for (unsigned i = 0; i < UNIMSG_MAX_CONNS; i++) {
+		unimsg_ring_enqueue(&shm->conn_pool.r, &i, 1);
+		shm->conn_pool.conns[i].queues[0].r.esize
+				= sizeof(struct unimsg_shm_desc);
+		shm->conn_pool.conns[i].queues[1].r.esize
+				= sizeof(struct unimsg_shm_desc);
+		shm->conn_pool.conns[i].queues[0].r.size = SOCK_QUEUE_SIZE;
+		shm->conn_pool.conns[i].queues[1].r.size = SOCK_QUEUE_SIZE;
+		shm->conn_pool.conns[i].queues[0].r.flags
+				= UNIMSG_RING_F_SP | UNIMSG_RING_F_SC;
+		shm->conn_pool.conns[i].queues[1].r.flags
+				= UNIMSG_RING_F_SP | UNIMSG_RING_F_SC;
+	}
+
+	/* Initialize the shm buffer pool */
+	shm->shm_pool.r.esize = sizeof(unsigned);
+	shm->shm_pool.r.size = UNIMSG_BUFFERS_COUNT;
+	shm->shm_pool.r.flags = 0;
+	for (unsigned i = 0; i < UNIMSG_BUFFERS_COUNT; i++)
+		unimsg_ring_enqueue(&shm->shm_pool.r, &i, 1);
+}
+
+static int shm_register_vm(struct vms_info *info, unsigned id, uint32_t addr)
+{
+	info->vm_info[id].addr = addr;
+
+	/* Update the routing table */
+	unsigned *bucket = &info->rt_buckets[jhash(&addr, sizeof(addr), 0)
+					     % UNIMSG_MAX_VMS];
+	unsigned curr_id = *bucket;
+	while (curr_id != UNIMSG_MAX_VMS) {
+		if (info->vm_info[curr_id].addr == addr)
+			return -EEXIST;
+		curr_id = info->vm_info[curr_id].rt_bkt_next;
+	}
+
+	info->vm_info[id].rt_bkt_next = *bucket;
+	*bucket = id;
+
+	return 0;
+}
+
+static void shm_unregister_vm(struct vms_info *info, unsigned id)
+{
+	uint32_t addr = info->vm_info[id].addr;
+
+	/* Remove the VM from the routing table bucket */
+	unsigned *bucket = &info->rt_buckets[jhash(&addr, sizeof(addr), 0)
+					     % UNIMSG_MAX_VMS];
+	unsigned curr_id = *bucket;
+	if (curr_id == id) {
+		*bucket = info->vm_info[id].rt_bkt_next;
+
+	} else {
+		/* Look for the preceding element in the bucket and make it
+		 * point to the successor
+		 */
+		while (curr_id != UNIMSG_MAX_VMS
+		       && info->vm_info[curr_id].rt_bkt_next != id)
+			curr_id = info->vm_info[curr_id].rt_bkt_next;
+
+		if (curr_id == UNIMSG_MAX_VMS)
+			ERROR("Unregistering unknown VM");
+
+		info->vm_info[curr_id].rt_bkt_next
+			= info->vm_info[id].rt_bkt_next;
+	}
+}
+
+static void init_sidecar_shm(unsigned id)
+{
+	char shm_path[PATH_MAX];
+	sprintf(shm_path, SIDECAR_SHM_PATH, id);
+
+	int shm_fd = shm_open(shm_path, O_RDWR, S_IRWXU);
+	if (shm_fd < 0)
+		SYSERROR("Error opening sidecar shared memory");
+
+	struct sidecar_shm *shm =
+		(struct sidecar_shm *)mmap(0, sizeof(*shm),
+					   PROT_READ | PROT_WRITE, MAP_SHARED,
+					   shm_fd, 0);
+	if (!shm)
+		SYSERROR("Error mapping sidecar shared memory");
+
+	sidecar_shms[id] = shm;
+
+	close(shm_fd);
+}
+
+static void scrape_sidecar_stats()
+{
+	struct sidecar_shm *shm;
+
+	printf("Sidecar stats:\n");
+	for (int id = 1; id < UNIMSG_MAX_VMS; id++) {
+		if (vms[id].id == -1)
+			continue;
+
+		if (!sidecar_shms[id])
+			init_sidecar_shm(id);
+
+		shm =sidecar_shms[id];
+
+		printf("%u: request count = %lu, response time ms = %lu, "
+		       "app request count = %lu, app response time ms = %lu, "
+		       "queue depth = %lu\n", id, shm->stats.request_count,
+		       shm->stats.response_time_ms,
+		       shm->stats.app_request_count,
+		       shm->stats.app_response_time_ms, shm->stats.queue_depth);
+	}
+
+	printf("\n");
+}
 
 static int ivshmem_server_sendmsg(int sock_fd, int64_t peer_id, int fd)
 {
@@ -167,13 +379,19 @@ static int ivshmem_server_handle_new_conn()
 		return 0;
 	}
 
+	/* VM addresses are currently built as 10.0.0.<id> */
+	/* TODO: read from file */
+	if (shm_register_vm(&shm->vms_info, id, 0xa | (id << 24)))
+		ERROR("Error registering VM to shared memory");
+
 	/* Handle a single vector for now */
 	vms[id].event_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
 	if (vms[id].event_fd < 0)
 		SYSERROR("Error creating eventfd");
 
 	/* Send our protocol version first */
-	ret = ivshmem_server_sendmsg(vms[id].sock_fd, IVSHMEM_PROTOCOL_VERSION, -1);
+	ret = ivshmem_server_sendmsg(vms[id].sock_fd, IVSHMEM_PROTOCOL_VERSION,
+				     -1);
 	if (ret < 0)
 		SYSERROR("Cannot send version");
 
@@ -254,6 +472,9 @@ static void *poll_events(void *arg)
 					ivshmem_server_free_peer(
 							active_vms[i - 1]);
 
+					shm_unregister_vm(&shm->vms_info,
+							  active_vms[i - 1]);
+
 					if (--ret == 0)
 						break;
 				}
@@ -262,172 +483,6 @@ static void *poll_events(void *arg)
 	}
 
 	return NULL;
-}
-
-static void sigint_handler(int signum)
-{
-	running = 0;
-}
-
-static void usage(const char *prog)
-{
-	// ERROR("  Usage: %s [OPTIONS]\n"
-	//       "  Options:\n"
-	//       "  -b, --burst	Number of decriptors to send in a burst (default %d)\n"
-	//       "  -s, --sleep	Microseconds to sleep between consecutive transmissions (default %d)\n"
-	//       "  -t, --threads	Number of threads to use (default %d)\n",
-	//       prog, DEFAULT_BURST, DEFAULT_SLEEP, DEFAULT_THREADS);
-
-	exit(EXIT_FAILURE);
-}
-
-static void parse_command_line(int argc, char **argv)
-{
-	// int option_index, c;
-
-	// for (;;) {
-	// 	c = getopt_long(argc, argv, "b:s:t:", long_options, &option_index);
-	// 	if (c == -1) {
-	// 		break;
-	// 	}
-
-	// 	switch (c) {
-	// 	case 'b':
-	// 		opt_burst = atoi(optarg);
-	// 		break;
-	// 	case 's':
-	// 		opt_sleep = atoi(optarg);
-	// 		break;
-	// 	case 't':
-	// 		opt_threads = atoi(optarg);
-	// 		break;
-	// 	default:
-	// 		usage(argv[0]);
-	// 	}
-	// }
-}
-
-void shm_init(struct unimsg_shm *shm)
-{
-	/* Fill the header */
-	shm->hdr.gw_backlog_off = (void *)&shm->gw_backlog - (void *)shm;
-	shm->hdr.rt_off = (void *)&shm->rt - (void *)shm;
-	shm->hdr.rt_sz = UNIMSG_RT_SIZE;
-	shm->hdr.signal_off = (void *)&shm->signal_queues - (void *)shm;
-	shm->hdr.signal_sz = sizeof(struct signal);
-	shm->hdr.listen_sock_map_off =
-		(void *)&shm->listen_sock_map - (void *)shm;
-	shm->hdr.listen_socks_off =
-		(void *)&shm->listen_sock_map.socks - (void *)shm;
-	shm->hdr.listen_sock_sz = sizeof(struct listen_sock);
-	shm->hdr.conn_pool_off = (void *)&shm->conn_pool - (void *)shm;
-	shm->hdr.conn_conns_off = (void *)&shm->conn_pool.conns - (void *)shm;
-	shm->hdr.conn_sz = sizeof(struct conn);
-	shm->hdr.conn_queue_sz = sizeof(struct sock_queue);
-	shm->hdr.shm_buffers_off = (void *)&shm->shm_pool - (void *)shm;
-
-	/* Initialize GW backlog */
-	struct unimsg_ring *r = &shm->gw_backlog.r;
-	r->esize = sizeof(unsigned);
-	r->size = BACKLOG_QUEUE_SIZE;
-	r->flags = UNIMSG_RING_F_SC;
-
-	/* Insert some dummy routes */
-	/* TODO: read from file or better build when running VMs */
-	shm->rt.routes[1].addr = 0x0100000a; /* 10.0.0.1 */
-	shm->rt.routes[1].peer_id = 1;
-	shm->rt.routes[2].addr = 0x0200000a; /* 10.0.0.2 */
-	shm->rt.routes[2].peer_id = 2;
-
-	/* Initialize signals */
-	for (int i = 0; i < UNIMSG_MAX_VMS; i++) {
-		shm->signal_queues[i].r.esize = sizeof(struct signal);
-		shm->signal_queues[i].r.size = SIGNAL_QUEUE_SIZE;
-		shm->signal_queues[i].r.flags = UNIMSG_RING_F_SC;
-	}
-
-	/* Initialize listen sock */
-	shm->listen_sock_map.size = UNIMSG_MAX_LISTEN_SOCKS;
-	shm->listen_sock_map.freelist_head = 0;
-	for (int i = 0; i < UNIMSG_MAX_LISTEN_SOCKS; i++) {
-		struct unimsg_ring *r = &shm->listen_sock_map.socks[i].backlog;
-		r->esize = sizeof(unsigned);
-		r->size = BACKLOG_QUEUE_SIZE;
-		r->flags = UNIMSG_RING_F_SC;
-		shm->listen_sock_map.socks[i].freelist_next = i + 1;
-		shm->listen_sock_map.buckets[i].head = UNIMSG_MAX_LISTEN_SOCKS;
-	}
-
-	/* Initialize connections */
-	shm->conn_pool.r.esize = sizeof(unsigned);
-	shm->conn_pool.r.size = UNIMSG_MAX_CONNS;
-	shm->conn_pool.r.flags = 0;
-	for (unsigned i = 0; i < UNIMSG_MAX_CONNS; i++) {
-		unimsg_ring_enqueue(&shm->conn_pool.r, &i, 1);
-		shm->conn_pool.conns[i].queues[0].r.esize
-				= sizeof(struct unimsg_shm_desc);
-		shm->conn_pool.conns[i].queues[1].r.esize
-				= sizeof(struct unimsg_shm_desc);
-		shm->conn_pool.conns[i].queues[0].r.size = SOCK_QUEUE_SIZE;
-		shm->conn_pool.conns[i].queues[1].r.size = SOCK_QUEUE_SIZE;
-		shm->conn_pool.conns[i].queues[0].r.flags
-				= UNIMSG_RING_F_SP | UNIMSG_RING_F_SC;
-		shm->conn_pool.conns[i].queues[1].r.flags
-				= UNIMSG_RING_F_SP | UNIMSG_RING_F_SC;
-	}
-
-	/* Initialize the shm buffer pool */
-	shm->shm_pool.r.esize = sizeof(unsigned);
-	shm->shm_pool.r.size = UNIMSG_BUFFERS_COUNT;
-	shm->shm_pool.r.flags = 0;
-	for (unsigned i = 0; i < UNIMSG_BUFFERS_COUNT; i++)
-		unimsg_ring_enqueue(&shm->shm_pool.r, &i, 1);
-}
-
-void init_sidecar_shm(unsigned id)
-{
-	char shm_path[PATH_MAX];
-	sprintf(shm_path, SIDECAR_SHM_PATH, id);
-
-	int shm_fd = shm_open(shm_path, O_RDWR, S_IRWXU);
-	if (shm_fd < 0)
-		SYSERROR("Error opening sidecar shared memory");
-
-	struct sidecar_shm *shm =
-		(struct sidecar_shm *)mmap(0, sizeof(*shm),
-					   PROT_READ | PROT_WRITE, MAP_SHARED,
-					   shm_fd, 0);
-	if (!shm)
-		SYSERROR("Error mapping sidecar shared memory");
-
-	sidecar_shms[id] = shm;
-
-	close(shm_fd);
-}
-
-static void scrape_sidecar_stats()
-{
-	struct sidecar_shm *shm;
-
-	printf("Sidecar stats:\n");
-	for (int id = 1; id < UNIMSG_MAX_VMS; id++) {
-		if (vms[id].id == -1)
-			continue;
-
-		if (!sidecar_shms[id])
-			init_sidecar_shm(id);
-
-		shm =sidecar_shms[id];
-
-		printf("%u: request count = %lu, response time ms = %lu, "
-		       "app request count = %lu, app response time ms = %lu, "
-		       "queue depth = %lu\n", id, shm->stats.request_count,
-		       shm->stats.response_time_ms,
-		       shm->stats.app_request_count,
-		       shm->stats.app_response_time_ms, shm->stats.queue_depth);
-	}
-
-	printf("\n");
 }
 
 int main(int argc, char *argv[])
@@ -444,10 +499,9 @@ int main(int argc, char *argv[])
 	if (ftruncate(shm_fd, DEFAULT_SHM_SIZE))
 		SYSERROR("Error setting shared memory size");
 
-	struct unimsg_shm *shm =
-		(struct unimsg_shm *)mmap(0, DEFAULT_SHM_SIZE,
-					  PROT_READ | PROT_WRITE, MAP_SHARED,
-					  shm_fd, 0);
+	shm = (struct unimsg_shm *)mmap(0, DEFAULT_SHM_SIZE,
+					PROT_READ | PROT_WRITE, MAP_SHARED,
+					shm_fd, 0);
 	if (!shm)
 		SYSERROR("Error mapping shared memory");
 

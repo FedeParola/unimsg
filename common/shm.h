@@ -19,7 +19,6 @@
 #define SOCK_QUEUE_SIZE 128
 #define UNIMSG_MAX_LISTEN_SOCKS 1024
 #define UNIMSG_MAX_CONNS 1024
-#define UNIMSG_RT_SIZE 1024
 #define UNIMSG_MAX_DESCS_BULK 16
 
 struct signal {
@@ -117,9 +116,9 @@ struct conn_pool {
 };
 
 struct unimsg_shm_header {
+	unsigned long vms_info_off;
+	unsigned long vms_info_sz;
 	unsigned long gw_backlog_off;
-	unsigned long rt_off;
-	unsigned long rt_sz;
 	unsigned long signal_off;
 	unsigned long signal_sz;
 	unsigned long listen_sock_map_off;
@@ -142,20 +141,20 @@ struct gw_backlog {
 	unsigned items[BACKLOG_QUEUE_SIZE];
 };
 
-struct route {
+struct vm_info {
 	uint32_t addr;
-	unsigned peer_id;
+	unsigned rt_bkt_next;
 };
 
-/* TODO: use a hash table and handle concurrent updates and reads */
-struct routing_table {
-	struct route routes[UNIMSG_RT_SIZE];
+struct vms_info {
+	struct vm_info vm_info[UNIMSG_MAX_VMS];
+	unsigned rt_buckets[UNIMSG_MAX_VMS];
 };
 
 struct unimsg_shm {
 	struct unimsg_shm_header hdr;
+	struct vms_info vms_info;
 	struct gw_backlog gw_backlog;
-	struct routing_table rt;
 	struct signal_queue signal_queues[UNIMSG_MAX_VMS];
 	struct listen_sock_map listen_sock_map;
 	struct conn_pool conn_pool;

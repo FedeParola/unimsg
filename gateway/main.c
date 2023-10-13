@@ -22,6 +22,7 @@
 #include "signal.h"
 #include "shm.h"
 #include "../common/error.h"
+#include "../common/jhash.h"
 #include "../common/shm.h"
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
@@ -62,10 +63,10 @@ struct app_ident{
 	uint32_t adr; 
 	uint16_t port;
 }; 
-struct app_ident app_idents[1] = {
-	{ .adr = 1, .port = 5000 },
-	// { .adr = 2, .port = 6000 }, 
-	// { .adr = 3, .port = 7000 },
+struct app_ident app_idents[] = {
+	{ .adr = 0x0100000a /* 10.0.0.1 in nbo */, .port = 5000 },
+	{ .adr = 0x0200000a /* 10.0.0.2 in nbo */, .port = 6000 }, 
+	{ .adr = 0x0300000a /* 10.0.0.3 in nbo */, .port = 7000 },
 };
 
 /* Cached mempool infos */
@@ -234,14 +235,30 @@ static void *get_buffers_shm()
 	return shm;
 }
 
+static int peer_lookup(uint32_t addr, unsigned *peer_id)
+{
+	unsigned id = control_shm->vms_info.rt_buckets[
+		jhash(&addr, sizeof(addr), 0) % UNIMSG_MAX_VMS];
+	while (id != UNIMSG_MAX_VMS) {
+		if (control_shm->vms_info.vm_info[id].addr == addr)
+			break;
+		id = control_shm->vms_info.vm_info[id].rt_bkt_next;
+	}
+
+	if (id == UNIMSG_MAX_VMS)
+		return -ENOENT;
+
+	*peer_id = id;
+
+	return 0;
+}
+
 static int connect_to_peer(uint32_t addr, uint16_t port, struct conn **c)
 {
 	int rc;
 
-	/* TODO: replace with hash lookup */
-	unsigned peer_id =
-		control_shm->rt.routes[addr % UNIMSG_RT_SIZE].peer_id;
-	if (!peer_id)
+	unsigned peer_id;
+	if (peer_lookup(addr, &peer_id))
 		return -ENETUNREACH;
 
 	struct listen_sock *ls;
@@ -261,7 +278,7 @@ static int connect_to_peer(uint32_t addr, uint16_t port, struct conn **c)
 	if (rc)
 		goto err_release_ls;
 
-	rc = listen_sock_send_conn(ls, *c);
+	rc = listen_sock_send_conn(ls, *c, peer_id);
 	if (rc)
 		goto err_free_conn;
 

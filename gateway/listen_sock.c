@@ -5,7 +5,7 @@
 #include <errno.h>
 #include <string.h>
 #include "connection.h"
-#include "jhash.h"
+#include "../common/jhash.h"
 #include "listen_sock.h"
 #include "signal.h"
 
@@ -108,7 +108,8 @@ void listen_sock_release(struct listen_sock *s)
 		listen_sock_free(s);	
 }
 
-int listen_sock_send_conn(struct listen_sock *s, struct conn *c)
+int listen_sock_send_conn(struct listen_sock *s, struct conn *c,
+			  unsigned peer_id)
 {
 	unsigned conn_idx = conn_get_idx(c);
 	if (unimsg_ring_enqueue(&s->backlog, &conn_idx, 1))
@@ -119,7 +120,7 @@ int listen_sock_send_conn(struct listen_sock *s, struct conn *c)
 	if (to_wake &&
 	    __atomic_compare_exchange_n(&s->waiting_accept, &to_wake, NULL, 0,
 					__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-		signal_send(s->key.addr, (struct signal *)&to_wake);
+		signal_send(peer_id, (struct signal *)&to_wake);
 
 	return 0;
 }
