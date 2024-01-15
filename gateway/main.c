@@ -449,29 +449,43 @@ int loop(void *arg)
 
 		} else if (event.filter == EVFILT_READ) {
 			void *mb;
-			ssize_t readlen = ff_read(clientfd, &mb, 4096);
-
-			/* get the data from the mb freebsd buf*/
-			char *msg = (char *)ff_mbuf_mtod(mb);
-			ff_mbuf_detach_rte(mb);
-			ff_mbuf_free(mb);
+			/* TODO: replace size limit with mb number limit, 3072
+			 * is just a raw estimate of the space available in a
+			 * shm buffer
+			 */
+			ssize_t readlen = ff_read(clientfd, &mb,
+						  UNIMSG_MAX_DESCS_BULK * 3072);
 
 			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
 								    clientfd);
 			if (!pair)
 				ERROR("No connection found\n");
 
-			struct unimsg_shm_desc desc;
-			desc.addr = msg;
-			desc.idx = buffer_get_idx(msg);
-			desc.size = readlen;
-			buffer_get_offset(&desc);
+			/* Map mbuf chain to shm descriptors array */
+			struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
+			unsigned ndescs = 0;
+			void *curr = mb;
+			while (curr) {
+				void *next = curr;
+				ff_next_mbuf(&next, &descs[ndescs].addr,
+					     &descs[ndescs].size);
+				descs[ndescs].idx =
+					buffer_get_idx(descs[ndescs].addr);
+				buffer_get_offset(&descs[ndescs]);
+				ndescs++;
 
-			int rc = conn_send(pair->conn, &desc, 1,
+				ff_mbuf_detach_rte(curr);
+
+				curr = next;
+			}
+			/* This frees the whole mbuf chain */
+			ff_mbuf_free(mb);
+
+			int rc = conn_send(pair->conn, descs, ndescs,
 					   pair->local_side);
 			if (rc) {
 				if (rc == -ECONNRESET) {
-					unimsg_buffer_put(&desc, 1);
+					unimsg_buffer_put(descs, ndescs);
 					ff_close(clientfd);
 					conn_close(pair->conn,
 						   pair->local_side);
@@ -480,9 +494,9 @@ int loop(void *arg)
 					/* The ring is full, we drop the packet
 					 * and let TCP handle retransmission
 					 */
-					unimsg_buffer_put(&desc, 1);
+					unimsg_buffer_put(descs, ndescs);
 				} else {
-					unimsg_buffer_put(&desc, 1);
+					unimsg_buffer_put(descs, ndescs);
 					ERROR("Error sending desc: %s\n",
 					      strerror(-rc));
 				}
@@ -544,19 +558,25 @@ int loop(void *arg)
 			}
 		}
 
+		/* Chain the messages */
+		void *head = NULL, *tail = NULL;
+		size_t tot_len = 0;
 		for (unsigned k = 0; k < ndescs; k++) {
 			char *msg = buffer_get_addr(&desc[k]);
+			tot_len += desc[k].size;
 
 			struct rte_mbuf *m = get_rte_mb_from_buffer(&desc[k]);
 			if (!m)
 				ERROR("Cannot map shm buffer to rte_mbuf\n");
-			void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg,
-						     m->data_len);
-			if (ff_write(fd_map[i].hostfd, bsd_mbuf, m->data_len)
-			    < 0)
-				SYSERROR("Error sending msg to remote host");
+
+			tail = ff_mbuf_get(tail, (void *)m, msg, m->data_len);
+			if (!head)
+				head = tail;
 		}
 
+		/* Send the chain */
+		if (ff_write(fd_map[i].hostfd, head, tot_len) < 0)
+			SYSERROR("Error sending msg to remote host");
 	}
 }
 
