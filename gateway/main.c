@@ -317,7 +317,7 @@ static int accept_local_connection()
 	struct sockaddr_in addr;
 	addr.sin_family = AF_INET;
 	addr.sin_port = htons(c->id.server_port);
-	addr.sin_addr.s_addr = htonl(c->id.server_addr);
+	addr.sin_addr.s_addr = c->id.server_addr;
 
 	/* Start connection establishment to remote peer */
 	if (ff_connect(sockfd, (struct linux_sockaddr *)&addr, sizeof(addr))
@@ -646,8 +646,6 @@ int main(int argc, char *argv[])
 	// if (sigaction(SIGINT, &sigact, NULL))
 	// 	SYSERROR("Error setting SIGINT handler");
 
-	// while (!stop)
-	// 	handle_peer_connection();
 	/* intialize the fd_map*/
 	initialize_fd_map();
 	gateway_start();
