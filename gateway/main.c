@@ -16,7 +16,9 @@
 #include <unistd.h>
 #include <ff_config.h>
 #include <ff_api.h>
+#ifndef VANILLA_FSTACK
 #include <ff_veth.h>
+#endif
 #include "connection.h"
 #include "listen_sock.h"
 #include "signal.h"
@@ -40,11 +42,18 @@
  */
 #define ACCEPT_BURST 8
 
+#ifndef VANILLA_FSTACK
 extern struct unimsg_ring *rte_mempool_unimsg_ring;
+#endif
 static int peers_fds[UNIMSG_MAX_VMS];
 static struct unimsg_shm *control_shm;
 static void *buffers_shm;
 static pthread_t mgr_handler_t;
+#ifdef VANILLA_FSTACK
+static struct unimsg_shm_desc rx_descs[UNIMSG_MAX_DESCS_BULK];
+static struct iovec rx_iovs[UNIMSG_MAX_DESCS_BULK];
+static unsigned rx_buff_available;
+#endif
 static volatile int stop = 0;
 
 /* f-stack thread variables*/
@@ -387,6 +396,118 @@ static void print_msg(char *msg, unsigned length)
 		printf("%c", msg[i]);
 }
 
+static void send_to_local(int src_fd, struct unimsg_shm_desc *descs,
+			  unsigned ndescs)
+{
+	struct fd_pair *pair = get_pair_from_hostfd(fd_map, src_fd);
+	if (!pair)
+		ERROR("No connection found\n");
+
+	int rc = conn_send(pair->conn, descs, ndescs, pair->local_side);
+	if (rc) {
+		if (rc == -ECONNRESET) {
+			unimsg_buffer_put(descs, ndescs);
+			ff_close(src_fd);
+			conn_close(pair->conn, pair->local_side);
+			remove_fd_pair(fd_map, src_fd);
+		} else if (rc == -EAGAIN) {
+			/* The ring is full, we drop the packet and let TCP
+			 * handle retransmission
+			 */
+			unimsg_buffer_put(descs, ndescs);
+		} else {
+			unimsg_buffer_put(descs, ndescs);
+			ERROR("Error sending desc: %s\n", strerror(-rc));
+		}
+	}
+}
+
+static void recv_from_remote(int fd)
+{
+#ifdef VANILLA_FSTACK
+	ssize_t readlen = ff_readv(fd, rx_iovs, UNIMSG_MAX_DESCS_BULK);
+	unsigned ndescs = readlen / rx_buff_available + 1;
+	for (unsigned j = 0; j < ndescs; j++)
+		rx_descs[j].size = rx_buff_available;
+	rx_descs[ndescs - 1].size = readlen % rx_buff_available;
+
+	send_to_local(fd, rx_descs, ndescs);
+
+	/* Replace used rx buffers */
+	int rc = unimsg_buffer_get(rx_descs, ndescs);
+	if (rc)
+		ERROR("Error allocating buffers: %s\n", strerror(rc));
+	for (unsigned i = 0; i < ndescs; i++) {
+		rx_iovs[i].iov_base = buffer_get_addr(&rx_descs[i]);
+		rx_iovs[i].iov_len = rx_descs[i].size;
+	}
+
+#else /* !VANILLA_FSTACK */
+	void *mb;
+	/* TODO: replace size limit with mb number limit, 3072 is just a raw
+	 * estimate of the space available in a shm buffer
+	 */
+	ssize_t readlen = ff_read(fd, &mb, UNIMSG_MAX_DESCS_BULK * 3072);
+
+	/* Map mbuf chain to shm descriptors array */
+	struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
+	unsigned ndescs = 0;
+	void *curr = mb;
+	while (curr) {
+		void *next = curr;
+		ff_next_mbuf(&next, &descs[ndescs].addr, &descs[ndescs].size);
+		descs[ndescs].idx = buffer_get_idx(descs[ndescs].addr);
+		buffer_get_offset(&descs[ndescs]);
+		ndescs++;
+		ff_mbuf_detach_rte(curr);
+		curr = next;
+	}
+	/* This frees the whole mbuf chain */
+	ff_mbuf_free(mb);
+
+	send_to_local(fd, descs, ndescs);
+#endif /* !VANILLA_FSTACK */
+}
+
+static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
+			   unsigned ndescs)
+{
+#ifdef VANILLA_FSTACK
+	/* Prepare iovs */
+	struct iovec iovs[UNIMSG_MAX_DESCS_BULK];
+	for (unsigned i = 0; i < ndescs; i++) {
+		iovs[i].iov_base = buffer_get_addr(&descs[i]);
+		iovs[i].iov_len = descs[i].size;
+	}
+
+	if (ff_writev(fd, iovs, ndescs) < 0)
+		SYSERROR("Error sending msg to remote host");
+
+	unimsg_buffer_put(descs, ndescs);
+
+#else /* !VANILLA_FSTACK */
+	/* Chain the messages */
+	void *head = NULL, *tail = NULL;
+	size_t tot_len = 0;
+	for (unsigned i = 0; i < ndescs; i++) {
+		char *msg = buffer_get_addr(&descs[i]);
+		tot_len += descs[i].size;
+
+		struct rte_mbuf *m = get_rte_mb_from_buffer(&descs[i]);
+		if (!m)
+			ERROR("Cannot map shm buffer to rte_mbuf\n");
+
+		tail = ff_mbuf_get(tail, (void *)m, msg, m->data_len);
+		if (!head)
+			head = tail;
+	}
+
+	/* Send the chain */
+	if (ff_write(fd, head, tot_len) < 0)
+		SYSERROR("Error sending msg to remote host");
+#endif /* !VANILLA_FSTACK */
+}
+
 int loop(void *arg)
 {
 	/* Wait for events to happen */
@@ -448,59 +569,7 @@ int loop(void *arg)
 			} while (available);
 
 		} else if (event.filter == EVFILT_READ) {
-			void *mb;
-			/* TODO: replace size limit with mb number limit, 3072
-			 * is just a raw estimate of the space available in a
-			 * shm buffer
-			 */
-			ssize_t readlen = ff_read(clientfd, &mb,
-						  UNIMSG_MAX_DESCS_BULK * 3072);
-
-			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
-								    clientfd);
-			if (!pair)
-				ERROR("No connection found\n");
-
-			/* Map mbuf chain to shm descriptors array */
-			struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
-			unsigned ndescs = 0;
-			void *curr = mb;
-			while (curr) {
-				void *next = curr;
-				ff_next_mbuf(&next, &descs[ndescs].addr,
-					     &descs[ndescs].size);
-				descs[ndescs].idx =
-					buffer_get_idx(descs[ndescs].addr);
-				buffer_get_offset(&descs[ndescs]);
-				ndescs++;
-
-				ff_mbuf_detach_rte(curr);
-
-				curr = next;
-			}
-			/* This frees the whole mbuf chain */
-			ff_mbuf_free(mb);
-
-			int rc = conn_send(pair->conn, descs, ndescs,
-					   pair->local_side);
-			if (rc) {
-				if (rc == -ECONNRESET) {
-					unimsg_buffer_put(descs, ndescs);
-					ff_close(clientfd);
-					conn_close(pair->conn,
-						   pair->local_side);
-					remove_fd_pair(fd_map, clientfd);
-				} else if (rc == -EAGAIN) {
-					/* The ring is full, we drop the packet
-					 * and let TCP handle retransmission
-					 */
-					unimsg_buffer_put(descs, ndescs);
-				} else {
-					unimsg_buffer_put(descs, ndescs);
-					ERROR("Error sending desc: %s\n",
-					      strerror(-rc));
-				}
-			}
+			recv_from_remote(clientfd);
 
 		} else if (event.filter == EVFILT_WRITE) {
 			/* Connection to remote host established */
@@ -536,10 +605,10 @@ int loop(void *arg)
 		/* Read from the connection */
 		struct conn *c = fd_map[i].conn;
 		enum conn_side side = fd_map[i].local_side;
-		struct unimsg_shm_desc desc[UNIMSG_MAX_DESCS_BULK];
+		struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
 		unsigned ndescs = UNIMSG_MAX_DESCS_BULK;
 		int rc;
-		rc = conn_recv(c, desc, &ndescs, side);
+		rc = conn_recv(c, descs, &ndescs, side);
 		if (rc) {
 			if (rc == -ECONNRESET) {
 				ff_close(fd_map[i].hostfd);
@@ -558,25 +627,7 @@ int loop(void *arg)
 			}
 		}
 
-		/* Chain the messages */
-		void *head = NULL, *tail = NULL;
-		size_t tot_len = 0;
-		for (unsigned k = 0; k < ndescs; k++) {
-			char *msg = buffer_get_addr(&desc[k]);
-			tot_len += desc[k].size;
-
-			struct rte_mbuf *m = get_rte_mb_from_buffer(&desc[k]);
-			if (!m)
-				ERROR("Cannot map shm buffer to rte_mbuf\n");
-
-			tail = ff_mbuf_get(tail, (void *)m, msg, m->data_len);
-			if (!head)
-				head = tail;
-		}
-
-		/* Send the chain */
-		if (ff_write(fd_map[i].hostfd, head, tot_len) < 0)
-			SYSERROR("Error sending msg to remote host");
+		send_to_remote(fd_map[i].hostfd, descs, ndescs);
 	}
 }
 
@@ -625,12 +676,16 @@ int main(int argc, char *argv[])
 	control_shm = setup_manager_connection();
 	buffers_shm = get_buffers_shm();
 
+#ifdef VANILLA_FSTACK
+	ff_init(argc, argv);
+#else
 	/* Configure the ring for the rte mempool */
 	/* TODO: this is awful, find a best API to set the ring */
 	rte_mempool_unimsg_ring = &control_shm->shm_pool.r;
 
 	ff_init(argc, argv, buffers_shm, UNIMSG_BUFFERS_COUNT,
 		UNIMSG_BUFFER_SIZE);
+#endif
 
 	cache_mempool_infos();
 	
@@ -649,6 +704,19 @@ int main(int argc, char *argv[])
 	/* intialize the fd_map*/
 	initialize_fd_map();
 	gateway_start();
+
+#ifdef VANILLA_FSTACK
+	/* Prepare pool of rx buffers and iovs */
+	int rc = unimsg_buffer_get(rx_descs, UNIMSG_MAX_DESCS_BULK);
+	if (rc)
+		ERROR("Error allocating buffers: %s\n", strerror(rc));
+	for (unsigned i = 0; i < UNIMSG_MAX_DESCS_BULK; i++) {
+		rx_iovs[i].iov_base = buffer_get_addr(&rx_descs[i]);
+		rx_iovs[i].iov_len = rx_descs[i].size;
+	}
+	rx_buff_available = rx_descs[0].size;
+#endif
+
 	ff_run(loop, NULL);	
 	pthread_join(mgr_handler_t, NULL);
 
