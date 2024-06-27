@@ -66,6 +66,7 @@ struct vm_data {
 	int id;
 	int sock_fd;
 	int event_fd;
+	int has_sidecar; /* 0 - to check; 1 - yes; 2 - no */
 };
 
 static struct unimsg_shm *shm;
@@ -251,8 +252,14 @@ static void init_sidecar_shm(unsigned id)
 	sprintf(shm_path, SIDECAR_SHM_PATH, id);
 
 	int shm_fd = shm_open(shm_path, O_RDWR, S_IRWXU);
-	if (shm_fd < 0)
-		SYSERROR("Error opening sidecar shared memory");
+	if (shm_fd < 0) {
+		if (errno == ENOENT) {
+			vms[id].has_sidecar = 2;
+			return;
+		} else {
+			SYSERROR("Error opening sidecar shared memory");
+		}
+	}
 
 	struct sidecar_shm *shm =
 		(struct sidecar_shm *)mmap(0, sizeof(*shm),
@@ -272,13 +279,16 @@ static void scrape_sidecar_stats()
 
 	printf("Sidecar stats:\n");
 	for (int id = 1; id < UNIMSG_MAX_VMS; id++) {
-		if (vms[id].id == -1)
+		if (vms[id].id == -1 || vms[id].has_sidecar == 2)
 			continue;
 
-		if (!sidecar_shms[id])
+		if (vms[id].has_sidecar == 0) {
 			init_sidecar_shm(id);
+			if (vms[id].has_sidecar == 2)
+				continue;
+		}
 
-		shm =sidecar_shms[id];
+		shm = sidecar_shms[id];
 
 		printf("%u: request count = %lu, response time ms = %lu, "
 		       "app request count = %lu, app response time ms = %lu, "
@@ -369,6 +379,7 @@ static int ivshmem_server_handle_new_conn()
 		if (vms[id].id == -1) {
 			vms[id].id = id;
 			vms[id].sock_fd = newfd;
+			vms[id].has_sidecar = 0;
 			break;
 		}
 	}
@@ -543,7 +554,7 @@ int main(int argc, char *argv[])
 		scrape_sidecar_stats();
 	}
 
-	pthread_join(events_poll_thread, NULL);	
+	pthread_join(events_poll_thread, NULL);
 	unlink(DEFAULT_UNIX_SOCK_PATH);
 	close(sock_fd);
 	close(shm_fd);
