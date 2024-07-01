@@ -33,8 +33,7 @@
 #define GATEWAY_ID 0
 #define IVSHMEM_PROT_VERSION 0
 #define MGR_SOCK_PATH "/tmp/ivshmem_socket"
-#define CONTROL_SHM_SIZE (sizeof(struct unimsg_shm))
-#define DEFAULT_SIZE 64 
+#define DEFAULT_SIZE 64
 #define RAND_UPPER_LIMIT 2
 #define RAND_LOWER_LIMIT 0
 /* Max number of consecutive connections the gateway can accept from local
@@ -46,8 +45,8 @@
 extern struct unimsg_ring *rte_mempool_unimsg_ring;
 #endif
 static int peers_fds[UNIMSG_MAX_VMS];
-static struct unimsg_shm *control_shm;
-static void *buffers_shm;
+static struct unimsg_shm *shm;
+static void *buffers_mem;
 static pthread_t mgr_handler_t;
 #ifdef VANILLA_FSTACK
 static struct unimsg_shm_desc rx_descs[UNIMSG_MAX_DESCS_BULK];
@@ -66,15 +65,15 @@ static int opt_size = DEFAULT_SIZE;
 #define NB_SOCKETS 8
 extern struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
 
-/* Setup Connection to multiple applications 
+/* Setup Connection to multiple applications
 running on different port with own identity*/
 struct app_ident{
-	uint32_t adr; 
+	uint32_t adr;
 	uint16_t port;
-}; 
+};
 struct app_ident app_idents[] = {
 	{ .adr = 0x0100000a /* 10.0.0.1 in nbo */, .port = 5000 },
-	{ .adr = 0x0200000a /* 10.0.0.2 in nbo */, .port = 6000 }, 
+	{ .adr = 0x0200000a /* 10.0.0.2 in nbo */, .port = 6000 },
 	{ .adr = 0x0300000a /* 10.0.0.3 in nbo */, .port = 7000 },
 };
 
@@ -154,7 +153,7 @@ void *mgr_notification_handler(void *arg)
 
 			peers_fds[val] = fd;
 			printf("Peer %ld registered\n", val);
-		
+
 		} else {
 			/* Peer disconnected */
 			peers_fds[val] = 0;
@@ -200,8 +199,8 @@ static void *setup_manager_connection()
 	if (val != -1 || aux_fd < 0)
 		ERROR("Error receiving control shm");
 
-	void *shm = mmap(0, CONTROL_SHM_SIZE, PROT_READ | PROT_WRITE,
-			 MAP_SHARED, aux_fd, 0);
+	void *shm = mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED,
+			 aux_fd, 0);
 	if (!shm)
 		SYSERROR("Error mapping control shm");
 
@@ -225,7 +224,7 @@ static void *setup_manager_connection()
 	return shm;
 }
 
-static void *get_buffers_shm()
+static void *get_buffers_mem()
 {
 	int fd = open(UNIMSG_BUFFERS_PATH, O_RDWR);
 	if (fd < 0)
@@ -246,12 +245,12 @@ static void *get_buffers_shm()
 
 static int peer_lookup(uint32_t addr, unsigned *peer_id)
 {
-	unsigned id = control_shm->vms_info.rt_buckets[
+	unsigned id = shm->vms_info.rt_buckets[
 		jhash(&addr, sizeof(addr), 0) % UNIMSG_MAX_VMS];
 	while (id != UNIMSG_MAX_VMS) {
-		if (control_shm->vms_info.vm_info[id].addr == addr)
+		if (shm->vms_info.vm_info[id].addr == addr)
 			break;
-		id = control_shm->vms_info.vm_info[id].rt_bkt_next;
+		id = shm->vms_info.vm_info[id].rt_bkt_next;
 	}
 
 	if (id == UNIMSG_MAX_VMS)
@@ -307,7 +306,7 @@ static int accept_local_connection()
 	int rc;
 	unsigned idx;
 
-	rc = unimsg_ring_dequeue(&control_shm->gw_backlog.r, &idx, 1);
+	rc = unimsg_ring_dequeue(&shm->gw_backlog.r, &idx, 1);
 	if (rc == -EAGAIN)
 		return rc;
 	if (rc)
@@ -348,19 +347,19 @@ static int accept_local_connection()
 
 static unsigned buffer_get_idx(void *addr)
 {
-	return (addr - buffers_shm) / UNIMSG_BUFFER_SIZE;
+	return (addr - buffers_mem) / UNIMSG_BUFFER_SIZE;
 }
 
 static void *buffer_get_addr(struct unimsg_shm_desc *desc)
 {
-	desc->addr = buffers_shm + UNIMSG_BUFFER_SIZE * desc->idx + desc->off;
+	desc->addr = buffers_mem + UNIMSG_BUFFER_SIZE * desc->idx + desc->off;
 	return desc->addr;
 }
 
 static unsigned buffer_get_offset(struct unimsg_shm_desc *desc)
 {
 	desc->off = (unsigned long)desc->addr % UNIMSG_BUFFER_SIZE;
-	
+
 	return desc->off;
 }
 
@@ -552,7 +551,7 @@ int loop(void *arg)
 				/* Random selection of radiobox server*/
 				// int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
 				int rd = 0;
-				/* Initiate connection to radiobox server */ 
+				/* Initiate connection to radiobox server */
 				struct conn *cn;
 				int ret = connect_to_peer(app_idents[rd].adr,
 							  app_idents[rd].port,
@@ -561,7 +560,7 @@ int loop(void *arg)
 					ERROR("connect_to_peer failed: %s\n",
 					      strerror(-ret));
 					continue;
-				}	
+				}
 				/* Add the pair to the map */
 				add_fd_pair(fd_map, nclientfd, cn,
 					    CONN_SIDE_CLI, 1);
@@ -646,12 +645,12 @@ void gateway_start()
 	sockfd = ff_socket(AF_INET, SOCK_STREAM, 0);
 	if (sockfd < 0)
 		SYSERROR("Error creating socket");
-	
+
 	/* Set non blocking */
 	int on = 1;
 	if (ff_ioctl(sockfd, FIONBIO, &on) < 0)
 		SYSERROR("Error setting non blocking");
-	
+
 	struct sockaddr_in my_addr;
 	bzero(&my_addr, sizeof(my_addr));
 	my_addr.sin_family = AF_INET;
@@ -673,26 +672,26 @@ void gateway_start()
 
 int main(int argc, char *argv[])
 {
-	control_shm = setup_manager_connection();
-	buffers_shm = get_buffers_shm();
+	shm = setup_manager_connection();
+	buffers_mem = (void *)shm + shm->hdr.shm_buffers_off;
 
 #ifdef VANILLA_FSTACK
 	ff_init(argc, argv);
 #else
 	/* Configure the ring for the rte mempool */
 	/* TODO: this is awful, find a best API to set the ring */
-	rte_mempool_unimsg_ring = &control_shm->shm_pool.r;
+	rte_mempool_unimsg_ring = &shm->shm_pool.r;
 
-	ff_init(argc, argv, buffers_shm, UNIMSG_BUFFERS_COUNT,
+	ff_init(argc, argv, buffers_mem, UNIMSG_BUFFERS_COUNT,
 		UNIMSG_BUFFER_SIZE);
 #endif
 
 	cache_mempool_infos();
-	
-	shm_init(control_shm, buffers_shm);
-	signal_init(control_shm, peers_fds);
-	conn_init(control_shm);
-	listen_sock_init(control_shm);
+
+	shm_init(shm, buffers_mem);
+	signal_init(shm, peers_fds);
+	conn_init(shm);
+	listen_sock_init(shm);
 
 	/* It looks like F-stack doesn't provide a mechanism to cleanly exit the
 	 * main loop, let Ctrl-C terminate the app directly for now
@@ -717,7 +716,7 @@ int main(int argc, char *argv[])
 	rx_buff_available = rx_descs[0].size;
 #endif
 
-	ff_run(loop, NULL);	
+	ff_run(loop, NULL);
 	pthread_join(mgr_handler_t, NULL);
 
 	return 0;

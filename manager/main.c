@@ -19,12 +19,12 @@
 #include "../common/shm.h"
 
 #define DEFAULT_UNIX_SOCK_PATH	 "/tmp/ivshmem_socket"
-#define DEFAULT_SHM_PATH 	 "/unimsg_control"
-#define DEFAULT_SHM_SIZE	 (8 * 1024 * 1024)
+#define SHM_PATH		 "/dev/hugepages/unimsg_shm"
 #define SERVER_LISTEN_BACKLOG	 10
 #define IVSHMEM_PROTOCOL_VERSION 0
 #define SIDECAR_MAX_FILTERS 	 16
 #define SIDECAR_SHM_PATH 	 "/unimsg_sidecar_%u"
+#define ALIGN_UP(v, a)		 (((v) + (a)-1) & ~((a)-1))
 
 enum sidecar_verdict {
 	SIDECAR_OK,
@@ -142,7 +142,12 @@ static void shm_init(struct unimsg_shm *shm)
 	shm->hdr.conn_conns_off = (void *)&shm->conn_pool.conns - (void *)shm;
 	shm->hdr.conn_sz = sizeof(struct conn);
 	shm->hdr.conn_queue_sz = sizeof(struct sock_queue);
-	shm->hdr.shm_buffers_off = (void *)&shm->shm_pool - (void *)shm;
+	shm->hdr.shm_pool_off = (void *)&shm->shm_pool - (void *)shm;
+	/* SHM buffers are located after the control region and are page
+	 * aligned
+	 */
+	shm->hdr.shm_buffers_off = ALIGN_UP(sizeof(struct unimsg_shm),
+					    PAGE_SIZE);
 
 	/* Initialize routing table */
 	for (unsigned i = 0; i < UNIMSG_MAX_VMS; i++)
@@ -502,17 +507,15 @@ int main(int argc, char *argv[])
 
 	/* Setup shared memory */
 
-	shm_fd = shm_open(DEFAULT_SHM_PATH, O_RDWR | O_CREAT | O_TRUNC,
-			  S_IRWXU);
+	shm_fd = open(SHM_PATH, O_RDWR | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 	if (shm_fd < 0)
 		SYSERROR("Error opening shared memory");
 
-	if (ftruncate(shm_fd, DEFAULT_SHM_SIZE))
+	if (ftruncate(shm_fd, SHM_SIZE))
 		SYSERROR("Error setting shared memory size");
 
-	shm = (struct unimsg_shm *)mmap(0, DEFAULT_SHM_SIZE,
-					PROT_READ | PROT_WRITE, MAP_SHARED,
-					shm_fd, 0);
+	shm = (struct unimsg_shm *)mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE,
+					MAP_SHARED, shm_fd, 0);
 	if (!shm)
 		SYSERROR("Error mapping shared memory");
 

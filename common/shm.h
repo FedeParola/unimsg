@@ -20,6 +20,7 @@
 #define UNIMSG_MAX_LISTEN_SOCKS 1024
 #define UNIMSG_MAX_CONNS 1024
 #define UNIMSG_MAX_DESCS_BULK 16
+#define SHM_SIZE (1024 * 1024 * 1024)
 
 struct signal {
 	unsigned long target_thread;
@@ -128,6 +129,7 @@ struct unimsg_shm_header {
 	unsigned long conn_conns_off;
 	unsigned long conn_sz;
 	unsigned long conn_queue_sz;
+	unsigned long shm_pool_off;
 	unsigned long shm_buffers_off;
 };
 
