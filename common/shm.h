@@ -9,9 +9,11 @@
 #include <unistd.h>
 #include "ring.h"
 
+#define ALIGN_UP(v, a) (((v) + (a)-1) & ~((a)-1))
 #define UNIMSG_BUFFERS_PATH "/dev/hugepages/unimsg_buffers"
 #define UNIMSG_MAX_VMS 16
 #define PAGE_SIZE (4 * 1024)
+#define HUGEPAGE_SIZE (2 * 1024 * 1024)
 #define UNIMSG_BUFFER_SIZE PAGE_SIZE
 #define UNIMSG_BUFFERS_COUNT 2048
 #define SIGNAL_QUEUE_SIZE 256
@@ -20,7 +22,9 @@
 #define UNIMSG_MAX_LISTEN_SOCKS 1024
 #define UNIMSG_MAX_CONNS 1024
 #define UNIMSG_MAX_DESCS_BULK 16
-#define SHM_SIZE (1024 * 1024 * 1024)
+#define SHM_SIZE (ALIGN_UP(ALIGN_UP(sizeof(struct unimsg_shm), PAGE_SIZE) +    \
+			   UNIMSG_BUFFER_SIZE * UNIMSG_BUFFERS_COUNT,	       \
+			   HUGEPAGE_SIZE))
 
 struct signal {
 	unsigned long target_thread;

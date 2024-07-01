@@ -24,7 +24,6 @@
 #define IVSHMEM_PROTOCOL_VERSION 0
 #define SIDECAR_MAX_FILTERS 	 16
 #define SIDECAR_SHM_PATH 	 "/unimsg_sidecar_%u"
-#define ALIGN_UP(v, a)		 (((v) + (a)-1) & ~((a)-1))
 
 enum sidecar_verdict {
 	SIDECAR_OK,
