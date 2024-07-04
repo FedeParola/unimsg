@@ -41,6 +41,8 @@
  */
 #define ACCEPT_BURST 8
 
+#define ARRAY_ITEMS(array) (sizeof(array) / sizeof(array[0]))
+
 #ifndef VANILLA_FSTACK
 extern struct unimsg_ring *rte_mempool_unimsg_ring;
 #endif
@@ -57,7 +59,6 @@ static volatile int stop = 0;
 
 /* f-stack thread variables*/
 int kq;
-int sockfd;
 #define MAX_EVENTS 512
 struct kevent kevSet;
 struct kevent events[MAX_EVENTS];
@@ -65,16 +66,24 @@ static int opt_size = DEFAULT_SIZE;
 #define NB_SOCKETS 8
 extern struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
 
-/* Setup Connection to multiple applications
-running on different port with own identity*/
-struct app_ident{
-	uint32_t adr;
+/* Applications accessible from the external network */
+struct public_app {
+	uint32_t addr;
 	uint16_t port;
+	int sock; /* Listening socket to accept incoming connections */
 };
-struct app_ident app_idents[] = {
-	{ .adr = 0x0100000a /* 10.0.0.1 in nbo */, .port = 5000 },
-	{ .adr = 0x0200000a /* 10.0.0.2 in nbo */, .port = 6000 },
-	{ .adr = 0x0300000a /* 10.0.0.3 in nbo */, .port = 7000 },
+
+struct public_app public_apps[] = {
+	{ .addr = 0x0100000a /* 10.0.0.1 in nbo */, .port = 5001 },
+	{ .addr = 0x0200000a /* 10.0.0.2 in nbo */, .port = 5002 },
+	{ .addr = 0x0300000a /* 10.0.0.3 in nbo */, .port = 5003 },
+	{ .addr = 0x0400000a /* 10.0.0.4 in nbo */, .port = 5004 },
+	{ .addr = 0x0500000a /* 10.0.0.5 in nbo */, .port = 5005 },
+	{ .addr = 0x0600000a /* 10.0.0.6 in nbo */, .port = 5006 },
+	{ .addr = 0x0700000a /* 10.0.0.7 in nbo */, .port = 5007 },
+	{ .addr = 0x0800000a /* 10.0.0.8 in nbo */, .port = 5008 },
+	{ .addr = 0x0900000a /* 10.0.0.9 in nbo */, .port = 5009 },
+	{ .addr = 0x0a00000a /* 10.0.0.10 in nbo */, .port = 5010 },
 };
 
 /* Cached mempool infos */
@@ -526,7 +535,8 @@ int loop(void *arg)
 			conn_close(pair->conn, pair->local_side);
 			remove_fd_pair(fd_map, clientfd);
 
-		} else if (clientfd == sockfd) {
+		} else if (event.udata) {
+			struct public_app *app = event.udata;
 			int available = (int)event.data;
 			do {
 				int nclientfd = ff_accept(clientfd, NULL, NULL);
@@ -548,13 +558,11 @@ int loop(void *arg)
 				}
 
 				available--;
-				/* Random selection of radiobox server*/
-				// int rd = (rand() % (RAND_UPPER_LIMIT - RAND_LOWER_LIMIT + 1)) + RAND_LOWER_LIMIT;
-				int rd = 0;
-				/* Initiate connection to radiobox server */
+				/* Connect to the corresponding (public) local
+				 * application
+				 */
 				struct conn *cn;
-				int ret = connect_to_peer(app_idents[rd].adr,
-							  app_idents[rd].port,
+				int ret = connect_to_peer(app->addr, app->port,
 							  &cn);
 				if (ret) {
 					ERROR("connect_to_peer failed: %s\n",
@@ -564,7 +572,6 @@ int loop(void *arg)
 				/* Add the pair to the map */
 				add_fd_pair(fd_map, nclientfd, cn,
 					    CONN_SIDE_CLI, 1);
-
 			} while (available);
 
 		} else if (event.filter == EVFILT_READ) {
@@ -642,32 +649,34 @@ void gateway_start()
 	if (kq < 0)
 		SYSERROR("Error creating kqueue");
 
-	sockfd = ff_socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0)
-		SYSERROR("Error creating socket");
+	/* Create a listening socket for each public app */
+	for (unsigned i = 0; i < ARRAY_ITEMS(public_apps); i++) {
+		struct public_app *app = &public_apps[i];
 
-	/* Set non blocking */
-	int on = 1;
-	if (ff_ioctl(sockfd, FIONBIO, &on) < 0)
-		SYSERROR("Error setting non blocking");
+		app->sock = ff_socket(AF_INET, SOCK_STREAM, 0);
+		if (app->sock < 0)
+			SYSERROR("Error creating socket");
 
-	struct sockaddr_in my_addr;
-	bzero(&my_addr, sizeof(my_addr));
-	my_addr.sin_family = AF_INET;
-	my_addr.sin_port = htons(80);
-	my_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+		int on = 1;
+		if (ff_ioctl(app->sock, FIONBIO, &on) < 0)
+			SYSERROR("Error setting non blocking");
 
-	if (ff_bind(sockfd, (struct linux_sockaddr *)&my_addr, sizeof(my_addr))
-	    < 0)
-		SYSERROR("Error binding socket");
+		struct sockaddr_in addr;
+		addr.sin_family = AF_INET;
+		addr.sin_port = htons(public_apps[i].port);
+		addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	if (ff_listen(sockfd, MAX_EVENTS) < 0)
-		SYSERROR("Error listening socket");
+		if (ff_bind(app->sock, (struct linux_sockaddr *)&addr,
+			    sizeof(addr)) < 0)
+			SYSERROR("Error binding socket");
 
-	EV_SET(&kevSet, sockfd, EVFILT_READ, EV_ADD, 0, 0, NULL);
-	if (ff_kevent(kq, &kevSet, 1, NULL, 0, NULL) < 0)
-		SYSERROR("Error registering kevent");
+		if (ff_listen(app->sock, MAX_EVENTS) < 0)
+			SYSERROR("Error listening socket");
 
+		EV_SET(&kevSet, app->sock, EVFILT_READ, EV_ADD, 0, 0, app);
+		if (ff_kevent(kq, &kevSet, 1, NULL, 0, NULL) < 0)
+			SYSERROR("Error registering kevent");
+	}
 }
 
 int main(int argc, char *argv[])
