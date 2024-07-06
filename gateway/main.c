@@ -477,23 +477,8 @@ static void recv_from_remote(int fd)
 #endif /* !VANILLA_FSTACK */
 }
 
-static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
-			   unsigned ndescs)
+static void send_chain(int fd, struct unimsg_shm_desc *descs, unsigned ndescs)
 {
-#ifdef VANILLA_FSTACK
-	/* Prepare iovs */
-	struct iovec iovs[UNIMSG_MAX_DESCS_BULK];
-	for (unsigned i = 0; i < ndescs; i++) {
-		iovs[i].iov_base = buffer_get_addr(&descs[i]);
-		iovs[i].iov_len = descs[i].size;
-	}
-
-	if (ff_writev(fd, iovs, ndescs) < 0)
-		SYSERROR("Error sending msg to remote host");
-
-	unimsg_buffer_put(descs, ndescs);
-
-#else /* !VANILLA_FSTACK */
 	/* Chain the messages */
 	void *head = NULL, *tail = NULL;
 	size_t tot_len = 0;
@@ -513,6 +498,42 @@ static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
 	/* Send the chain */
 	if (ff_write(fd, head, tot_len) < 0)
 		SYSERROR("Error sending msg to remote host");
+}
+
+static void send_individual(int fd, struct unimsg_shm_desc *descs,
+			    unsigned ndescs)
+{
+	for (unsigned i = 0; i < ndescs; i++) {
+		char *msg = buffer_get_addr(&descs[i]);
+
+		struct rte_mbuf *m = get_rte_mb_from_buffer(&descs[i]);
+		if (!m)
+			ERROR("Cannot map shm buffer to rte_mbuf\n");
+		void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg, m->data_len);
+		if (ff_write(fd, bsd_mbuf, m->data_len) < 0)
+			SYSERROR("Error sending msg to remote host");
+	}
+}
+
+static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
+			   unsigned ndescs)
+{
+#ifdef VANILLA_FSTACK
+	/* Prepare iovs */
+	struct iovec iovs[UNIMSG_MAX_DESCS_BULK];
+	for (unsigned i = 0; i < ndescs; i++) {
+		iovs[i].iov_base = buffer_get_addr(&descs[i]);
+		iovs[i].iov_len = descs[i].size;
+	}
+
+	if (ff_writev(fd, iovs, ndescs) < 0)
+		SYSERROR("Error sending msg to remote host");
+
+	unimsg_buffer_put(descs, ndescs);
+
+#else /* !VANILLA_FSTACK */
+	send_chain(fd, descs, ndescs);
+	// send_individual(fd, descs, ndescs);
 #endif /* !VANILLA_FSTACK */
 }
 
