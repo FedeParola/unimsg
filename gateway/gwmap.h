@@ -17,6 +17,9 @@ struct fd_pair {
 	 * pending
 	 */
 	int connected;
+	int remote_busy;
+	/* Pending message to send to remote end */
+	struct rte_mbuf *pending_remotes;
 };
 
 #define MAX_CONNECTIONS 512

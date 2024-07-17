@@ -510,8 +510,44 @@ static void send_individual(int fd, struct unimsg_shm_desc *descs,
 		if (!m)
 			ERROR("Cannot map shm buffer to rte_mbuf\n");
 		void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg, m->data_len);
-		if (ff_write(fd, bsd_mbuf, m->data_len) < 0)
-			SYSERROR("Error sending msg to remote host");
+
+		if (ff_write(fd, bsd_mbuf, m->data_len) < 0) {
+			if (errno != EWOULDBLOCK)
+				SYSERROR("Error sending msg to remote host");
+
+			struct fd_pair *pair = get_pair_from_hostfd(fd_map, fd);
+			if (!pair)
+				ERROR("Fd pair not found");
+
+			/* The socket is busy, disable sending until there is
+			 * enough room to send the first message
+			 */
+			struct kevent kev;
+			EV_SET(&kev, fd, EVFILT_WRITE, EV_ADD, NOTE_LOWAT,
+			       m->data_len, NULL);
+			if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+				SYSERROR("Error updating kevents");
+
+			ff_mbuf_detach_rte(bsd_mbuf);
+			ff_mbuf_free(bsd_mbuf);
+
+			struct rte_mbuf *tail = m;
+			pair->pending_remotes = m;
+			for (unsigned j = i + 1; j < ndescs; j++) {
+				m = get_rte_mb_from_buffer(&descs[j]);
+				if (!m)
+					ERROR("Cannot map shm buffer to rte_mbuf\n");
+				tail->next = m;
+				tail = m;
+			}
+			tail->next = NULL;
+
+			pair->remote_busy = 1;
+
+			printf("Blocking on %d with %u buffs\n", fd, ndescs - i);
+
+			return;
+		}
 	}
 }
 
@@ -532,8 +568,8 @@ static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
 	unimsg_buffer_put(descs, ndescs);
 
 #else /* !VANILLA_FSTACK */
-	send_chain(fd, descs, ndescs);
-	// send_individual(fd, descs, ndescs);
+	// send_chain(fd, descs, ndescs);
+	send_individual(fd, descs, ndescs);
 #endif /* !VANILLA_FSTACK */
 }
 
@@ -599,20 +635,63 @@ int loop(void *arg)
 			recv_from_remote(clientfd);
 
 		} else if (event.filter == EVFILT_WRITE) {
-			/* Connection to remote host established */
-			struct kevent kevs[2];
-			EV_SET(&kevs[0], clientfd, EVFILT_WRITE, EV_DELETE, 0,
-			       0, NULL);
-			EV_SET(&kevs[1], clientfd, EVFILT_READ, EV_ADD, 0, 0,
-			       NULL);
-			if (ff_kevent(kq, kevs, 2, NULL, 0, NULL) < 0)
-				SYSERROR("Error updating kevents");
-
 			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
 								    clientfd);
 			if (!pair)
 				ERROR("No connection found");
-			pair->connected = 1;
+
+			if (pair->pending_remotes) {
+				if (event.data < pair->pending_remotes->data_len)
+					ERROR("Invalid send size on socket");
+
+				/* Try to send all pending messages */
+				while (pair->pending_remotes
+				       && event.data >= pair->pending_remotes->data_len) {
+					struct rte_mbuf *m = pair->pending_remotes;
+					pair->pending_remotes = m->next;
+					m->next = NULL;
+
+					void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, rte_pktmbuf_mtod(m, void *), m->data_len);
+					printf("Gonna send on %d\n", clientfd);
+					if (ff_write(pair->hostfd, bsd_mbuf, m->data_len) < 0)
+						SYSERROR("Error sending pending message");
+
+					event.data -= m->data_len;
+
+					printf("Pushed one on %d\n", clientfd);
+				}
+
+				if (!pair->pending_remotes) {
+					/* All pending sent, we can resume receiving from local */
+					pair->remote_busy = 0;
+					struct kevent kev;
+					EV_SET(&kev, clientfd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+					if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+						SYSERROR("Error updating kevents");
+					printf("Unblocking on %d\n", clientfd);
+				} else {
+					/* Adjust expected size */
+					struct kevent kev;
+					EV_SET(&kev, clientfd, EVFILT_WRITE,
+					       EV_ADD, NOTE_LOWAT,
+					       pair->pending_remotes->data_len,
+					       NULL);
+					if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+						SYSERROR("Error updating kevents");
+					printf("Staying blocked on %d\n", clientfd);
+				}
+			} else {
+				/* Connection to remote host established */
+				struct kevent kevs[2];
+				EV_SET(&kevs[0], clientfd, EVFILT_WRITE,
+				       EV_DELETE, 0, 0, NULL);
+				EV_SET(&kevs[1], clientfd, EVFILT_READ, EV_ADD,
+				       0, 0, NULL);
+				if (ff_kevent(kq, kevs, 2, NULL, 0, NULL) < 0)
+					SYSERROR("Error updating kevents");
+
+				pair->connected = 1;
+			}
 
 		} else {
 			printf("unknown event: %8.8X\n", event.flags);
@@ -626,7 +705,8 @@ int loop(void *arg)
 	}
 
 	for (int i = 0; i < MAX_CONNECTIONS; i++) {
-		if (fd_map[i].hostfd == -1 || !fd_map[i].connected)
+		if (fd_map[i].hostfd == -1 || !fd_map[i].connected
+		    || fd_map[i].remote_busy)
 			continue;
 
 		/* Read from the connection */
