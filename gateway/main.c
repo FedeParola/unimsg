@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/queue.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -29,7 +30,7 @@
 #include <rte_mbuf.h>
 #include <rte_mbuf_core.h>
 #include <sys/ioctl.h>
-#include "gwmap.h"
+
 #define GATEWAY_ID 0
 #define IVSHMEM_PROT_VERSION 0
 #define MGR_SOCK_PATH "/tmp/ivshmem_socket"
@@ -42,6 +43,11 @@
 #define ACCEPT_BURST 8
 
 #define ARRAY_ITEMS(array) (sizeof(array) / sizeof(array[0]))
+
+#define	LIST_FOREACH_SAFE(var, head, field, tvar)			\
+	for ((var) = LIST_FIRST((head));				\
+	    (var) && ((tvar) = LIST_NEXT((var), field), 1);		\
+	    (var) = (tvar))
 
 #ifndef VANILLA_FSTACK
 extern struct unimsg_ring *rte_mempool_unimsg_ring;
@@ -57,23 +63,43 @@ static unsigned rx_buff_available;
 #endif
 static volatile int stop = 0;
 
-/* f-stack thread variables*/
-int kq;
+/* Kqueue to receive events from F-stack */
 #define MAX_EVENTS 512
-struct kevent kevSet;
-struct kevent events[MAX_EVENTS];
-static int opt_size = DEFAULT_SIZE;
+static int kq;
+
+/* Defined in F-stack lib/ff_dpdk_if.c */
 #define NB_SOCKETS 8
 extern struct rte_mempool *pktmbuf_pool[NB_SOCKETS];
+
+enum proxy_conn_status {
+	CONN_LISTENING,
+	CONN_WAITING_REMOTE,
+	CONN_OPEN,
+};
+
+/* Splicing between a local and a remote connection */
+struct proxy_conn {
+	LIST_ENTRY(proxy_conn) list;
+	enum proxy_conn_status status;
+	int fd;
+	struct conn *local_conn;
+	enum conn_side local_side;
+	struct rte_mbuf *pending_to_remote;
+	struct public_app *app;
+};
+
+/* Proxy connections that can receive data from the local side
+ * (i.e., backpressure towards remote is not active)
+ */
+LIST_HEAD(list_head, proxy_conn) active_conns;
 
 /* Applications accessible from the external network */
 struct public_app {
 	uint32_t addr;
 	uint16_t port;
-	int sock; /* Listening socket to accept incoming connections */
 };
 
-struct public_app public_apps[] = {
+static struct public_app public_apps[] = {
 	{ .addr = 0x0100000a /* 10.0.0.1 in nbo */, .port = 5001 },
 	{ .addr = 0x0200000a /* 10.0.0.2 in nbo */, .port = 5002 },
 	{ .addr = 0x0300000a /* 10.0.0.3 in nbo */, .port = 5003 },
@@ -319,16 +345,23 @@ static int accept_local_connection()
 	if (rc == -EAGAIN)
 		return rc;
 	if (rc)
-		ERROR("Error accepting local  connection: %s\n", strerror(-rc));
+		ERROR("Error accepting local connection: %s\n", strerror(-rc));
 
 	struct conn *c = conn_from_idx(idx);
 
-	int sockfd = ff_socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0)
+	struct proxy_conn *pconn = calloc(1, sizeof(*pconn));
+	if (!pconn)
+		SYSERROR("Error allocating proxy connection");
+	pconn->status = CONN_WAITING_REMOTE;
+	pconn->local_conn = c;
+	pconn->local_side = CONN_SIDE_SRV;
+
+	pconn->fd = ff_socket(AF_INET, SOCK_STREAM, 0);
+	if (pconn->fd < 0)
 		SYSERROR("Error creating socket");
 
 	int on = 1;
-	if (ff_ioctl(sockfd, FIONBIO, &on) < 0)
+	if (ff_ioctl(pconn->fd, FIONBIO, &on) < 0)
 		SYSERROR("Error setting non blocking");
 
 	struct sockaddr_in addr;
@@ -336,8 +369,8 @@ static int accept_local_connection()
 	addr.sin_port = htons(c->id.server_port);
 	addr.sin_addr.s_addr = c->id.server_addr;
 
-	/* Start connection establishment to remote peer */
-	if (ff_connect(sockfd, (struct linux_sockaddr *)&addr, sizeof(addr))
+	/* Start connection establishment to remote */
+	if (ff_connect(pconn->fd, (struct linux_sockaddr *)&addr, sizeof(addr))
 	    < 0) {
 		if (errno != EINPROGRESS)
 			SYSERROR("Error connecting to remote host");
@@ -345,11 +378,9 @@ static int accept_local_connection()
 
 	/* A WRITE event notifies connection established */
 	struct kevent kev;
-	EV_SET(&kev, sockfd, EVFILT_WRITE, EV_ADD, 0, 0, NULL);
+	EV_SET(&kev, pconn->fd, EVFILT_WRITE, EV_ADD, 0, 0, pconn);
 	if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
 		SYSERROR("Error updating kevents");
-
-	add_fd_pair(fd_map, sockfd, c, CONN_SIDE_SRV, 0);
 
 	return 0;
 }
@@ -398,31 +429,24 @@ static struct rte_mbuf *get_rte_mb_from_buffer(struct unimsg_shm_desc *desc)
 	return mb;
 }
 
-static void print_msg(char *msg, unsigned length)
+static void send_to_local(struct proxy_conn *pconn,
+			  struct unimsg_shm_desc *descs, unsigned ndescs)
 {
-	for (unsigned i = 0; i < length; i++)
-		printf("%c", msg[i]);
-}
-
-static void send_to_local(int src_fd, struct unimsg_shm_desc *descs,
-			  unsigned ndescs)
-{
-	struct fd_pair *pair = get_pair_from_hostfd(fd_map, src_fd);
-	if (!pair)
-		ERROR("No connection found\n");
-
-	int rc = conn_send(pair->conn, descs, ndescs, pair->local_side);
+again:;
+	int rc = conn_send(pconn->local_conn, descs, ndescs, pconn->local_side);
 	if (rc) {
 		if (rc == -ECONNRESET) {
 			unimsg_buffer_put(descs, ndescs);
-			ff_close(src_fd);
-			conn_close(pair->conn, pair->local_side);
-			remove_fd_pair(fd_map, src_fd);
+			ff_close(pconn->fd);
+			conn_close(pconn->local_conn, pconn->local_side);
+
 		} else if (rc == -EAGAIN) {
-			/* The ring is full, we drop the packet and let TCP
-			 * handle retransmission
+			/* TODO: need to park buffers somewhere and stop
+			 * receiving from remote. TCP has already acknowledged
+			 * these segments, so we can't droop them
 			 */
-			unimsg_buffer_put(descs, ndescs);
+			printf("Local app is busy, time to handle this\n");
+			goto again;
 		} else {
 			unimsg_buffer_put(descs, ndescs);
 			ERROR("Error sending desc: %s\n", strerror(-rc));
@@ -430,7 +454,16 @@ static void send_to_local(int src_fd, struct unimsg_shm_desc *descs,
 	}
 }
 
-static void recv_from_remote(int fd)
+void close_proxy_conn(struct proxy_conn *pconn)
+{
+	if (pconn->status == CONN_OPEN)
+		LIST_REMOVE(pconn, list);
+	ff_close(pconn->fd);
+	conn_close(pconn->local_conn, pconn->local_side);
+	free(pconn);
+}
+
+static void recv_from_remote(struct proxy_conn *pconn)
 {
 #ifdef VANILLA_FSTACK
 	ssize_t readlen = ff_readv(fd, rx_iovs, UNIMSG_MAX_DESCS_BULK);
@@ -455,7 +488,13 @@ static void recv_from_remote(int fd)
 	/* TODO: replace size limit with mb number limit, 3072 is just a raw
 	 * estimate of the space available in a shm buffer
 	 */
-	ssize_t readlen = ff_read(fd, &mb, UNIMSG_MAX_DESCS_BULK * 3072);
+	ssize_t readlen = ff_read(pconn->fd, &mb, UNIMSG_MAX_DESCS_BULK * 3072);
+	if (readlen < 0) {
+		SYSERROR("Error receiving from remote host");
+	} else if (readlen == 0) {
+		/* Remote host disconnected */
+		close_proxy_conn(pconn);
+	}
 
 	/* Map mbuf chain to shm descriptors array */
 	struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
@@ -469,15 +508,26 @@ static void recv_from_remote(int fd)
 		ndescs++;
 		ff_mbuf_detach_rte(curr);
 		curr = next;
+
+		if (ndescs == UNIMSG_MAX_DESCS_BULK) {
+			send_to_local(pconn, descs, ndescs);
+			ndescs = 0;
+		}
 	}
+
+	if (ndescs > 0)
+		send_to_local(pconn, descs, ndescs);
+
 	/* This frees the whole mbuf chain */
 	ff_mbuf_free(mb);
-
-	send_to_local(fd, descs, ndescs);
 #endif /* !VANILLA_FSTACK */
 }
 
-static void send_chain(int fd, struct unimsg_shm_desc *descs, unsigned ndescs)
+/* TODO: add EOM (End Of Message) flag to descriptors to kick transmission on
+ * message boundary
+ */
+static void send_chain(struct proxy_conn *pconn, struct unimsg_shm_desc *descs,
+		       unsigned ndescs)
 {
 	/* Chain the messages */
 	void *head = NULL, *tail = NULL;
@@ -496,12 +546,14 @@ static void send_chain(int fd, struct unimsg_shm_desc *descs, unsigned ndescs)
 	}
 
 	/* Send the chain */
-	if (ff_write(fd, head, tot_len) < 0)
+	if (ff_write(pconn->fd, head, tot_len) < 0) {
+		/* TODO: Add backpressure */
 		SYSERROR("Error sending msg to remote host");
+	}
 }
 
-static void send_individual(int fd, struct unimsg_shm_desc *descs,
-			    unsigned ndescs)
+static void send_individual(struct proxy_conn *pconn,
+			    struct unimsg_shm_desc *descs, unsigned ndescs)
 {
 	for (unsigned i = 0; i < ndescs; i++) {
 		char *msg = buffer_get_addr(&descs[i]);
@@ -511,48 +563,45 @@ static void send_individual(int fd, struct unimsg_shm_desc *descs,
 			ERROR("Cannot map shm buffer to rte_mbuf\n");
 		void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, msg, m->data_len);
 
-		if (ff_write(fd, bsd_mbuf, m->data_len) < 0) {
+		if (ff_write(pconn->fd, bsd_mbuf, m->data_len) < 0) {
 			if (errno != EWOULDBLOCK)
 				SYSERROR("Error sending msg to remote host");
-
-			struct fd_pair *pair = get_pair_from_hostfd(fd_map, fd);
-			if (!pair)
-				ERROR("Fd pair not found");
 
 			/* The socket is busy, disable sending until there is
 			 * enough room to send the first message
 			 */
+			LIST_REMOVE(pconn, list);
+
 			struct kevent kev;
-			EV_SET(&kev, fd, EVFILT_WRITE, EV_ADD, NOTE_LOWAT,
-			       m->data_len, NULL);
+			EV_SET(&kev, pconn->fd, EVFILT_WRITE, EV_ADD,
+			       NOTE_LOWAT, m->data_len, pconn);
 			if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
 				SYSERROR("Error updating kevents");
+			unsigned needed = m->data_len;
 
 			ff_mbuf_detach_rte(bsd_mbuf);
 			ff_mbuf_free(bsd_mbuf);
 
 			struct rte_mbuf *tail = m;
-			pair->pending_remotes = m;
+			pconn->pending_to_remote = m;
 			for (unsigned j = i + 1; j < ndescs; j++) {
 				m = get_rte_mb_from_buffer(&descs[j]);
-				if (!m)
-					ERROR("Cannot map shm buffer to rte_mbuf\n");
+				if (!m) {
+					ERROR("Cannot map shm buffer to "
+					      "rte_mbuf\n");
+				}
 				tail->next = m;
 				tail = m;
 			}
 			tail->next = NULL;
-
-			pair->remote_busy = 1;
-
-			printf("Blocking on %d with %u buffs\n", fd, ndescs - i);
 
 			return;
 		}
 	}
 }
 
-static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
-			   unsigned ndescs)
+static void send_to_remote(struct proxy_conn *pconn,
+			   struct unimsg_shm_desc *descs, unsigned ndescs)
 {
 #ifdef VANILLA_FSTACK
 	/* Prepare iovs */
@@ -569,132 +618,131 @@ static void send_to_remote(int fd, struct unimsg_shm_desc *descs,
 
 #else /* !VANILLA_FSTACK */
 	// send_chain(fd, descs, ndescs);
-	send_individual(fd, descs, ndescs);
+	send_individual(pconn, descs, ndescs);
 #endif /* !VANILLA_FSTACK */
+}
+
+void accept_remote_connection(struct proxy_conn *pconn)
+{
+	struct proxy_conn *new = calloc(1, sizeof(*new));
+	if (!new)
+		SYSERROR("Error allocating proxy connection");
+
+	new->fd = ff_accept(pconn->fd, NULL, NULL);
+	if (new->fd < 0)
+		SYSERROR("ff_accept failed");
+
+	/* Connect to the corresponding (public) local application */
+	int ret = connect_to_peer(pconn->app->addr, pconn->app->port,
+				  &new->local_conn);
+	if (ret)
+		ERROR("connect_to_peer failed: %s\n", strerror(-ret));
+	new->local_side = CONN_SIDE_CLI;
+	new->status = CONN_OPEN;
+
+	LIST_INSERT_HEAD(&active_conns, new, list);
+
+	/* Add to event list */
+	struct kevent kev;
+	EV_SET(&kev, new->fd, EVFILT_READ, EV_ADD, 0, 0, new);
+	if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+		SYSERROR("ff_kevent error");
+}
+
+void send_pending_to_remote(struct proxy_conn *pconn, int available)
+{
+	if (available < pconn->pending_to_remote->data_len)
+		ERROR("Invalid send size on socket");
+
+	/* Try to send all pending messages */
+	while (pconn->pending_to_remote
+	       && available >= pconn->pending_to_remote->data_len) {
+		struct rte_mbuf *m = pconn->pending_to_remote;
+		pconn->pending_to_remote = m->next;
+		m->next = NULL;
+
+		void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m,
+					     rte_pktmbuf_mtod(m, void *),
+					     m->data_len);
+		if (ff_write(pconn->fd, bsd_mbuf, m->data_len) < 0)
+			SYSERROR("Error sending pending message");
+
+		available -= m->data_len;
+	}
+
+	struct kevent kev;
+	if (!pconn->pending_to_remote) {
+		/* All pending sent, we can resume receiving from local */
+		LIST_INSERT_HEAD(&active_conns, pconn, list);
+		EV_SET(&kev, pconn->fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
+		if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+			SYSERROR("Error updating kevents");
+
+	} else {
+		/* Adjust expected size */
+		EV_SET(&kev, pconn->fd, EVFILT_WRITE, EV_ADD, NOTE_LOWAT,
+			pconn->pending_to_remote->data_len, pconn);
+		if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
+			SYSERROR("Error updating kevents");
+	}
 }
 
 int loop(void *arg)
 {
+	struct kevent events[MAX_EVENTS];
+
 	/* Wait for events to happen */
 	int nevents = ff_kevent(kq, NULL, 0, events, MAX_EVENTS, NULL);
 	if (nevents < 0)
 		SYSERROR("Error waiting for events");
 
-	for (int i = 0; i < nevents; ++i) {
-		struct kevent event = events[i];
-		int clientfd = (int)event.ident;
+	for (int i = 0; i < nevents; i++) {
+		struct kevent *event = &events[i];
 
-		if (event.flags & EV_EOF) {
-			/* Handle disconnect */
-			ff_close(clientfd);
-			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
-								    clientfd);
-			conn_close(pair->conn, pair->local_side);
-			remove_fd_pair(fd_map, clientfd);
+		if (event->filter != EVFILT_READ
+		    && event->filter != EVFILT_WRITE)
+			ERROR("Received unexpected event filter\n");
 
-		} else if (event.udata) {
-			struct public_app *app = event.udata;
-			int available = (int)event.data;
-			do {
-				int nclientfd = ff_accept(clientfd, NULL, NULL);
-				if (nclientfd < 0) {
-					printf("ff_accept failed:%d, %s\n",
-					       errno, strerror(errno));
-					break;
-				}
+		struct proxy_conn *pconn = event->udata;
+		if (!pconn)
+			ERROR("Event is not carrying proxy connection");
+		if (event->ident != pconn->fd)
+			ERROR("Fd mismatch on event\n");
 
-				/* Add to event list */
-				EV_SET(&kevSet, nclientfd, EVFILT_READ, EV_ADD,
-				       0, 0, NULL);
+		if (event->flags & EV_EOF) {
+			/* Remote host closed the connection */
+			close_proxy_conn(pconn);
 
-				if (ff_kevent(kq, &kevSet, 1, NULL, 0, NULL)
-				    < 0) {
-					printf("ff_kevent error:%d, %s\n",
-					       errno, strerror(errno));
-					return -1;
-				}
+		} else if (event->filter == EVFILT_READ) {
+			if (pconn->status == CONN_LISTENING) {
+				for (int j = 0; j < event->data; j++)
+					accept_remote_connection(pconn);
+			} else if (pconn->status == CONN_OPEN) {
+				recv_from_remote(pconn);
+			} else {
+				ERROR("Received read event on unexpected conn "
+				      "status (fd=%d, status=%d)", pconn->fd,
+				      pconn->status);
+			}
 
-				available--;
-				/* Connect to the corresponding (public) local
-				 * application
-				 */
-				struct conn *cn;
-				int ret = connect_to_peer(app->addr, app->port,
-							  &cn);
-				if (ret) {
-					ERROR("connect_to_peer failed: %s\n",
-					      strerror(-ret));
-					continue;
-				}
-				/* Add the pair to the map */
-				add_fd_pair(fd_map, nclientfd, cn,
-					    CONN_SIDE_CLI, 1);
-			} while (available);
-
-		} else if (event.filter == EVFILT_READ) {
-			recv_from_remote(clientfd);
-
-		} else if (event.filter == EVFILT_WRITE) {
-			struct fd_pair *pair = get_pair_from_hostfd(fd_map,
-								    clientfd);
-			if (!pair)
-				ERROR("No connection found");
-
-			if (pair->pending_remotes) {
-				if (event.data < pair->pending_remotes->data_len)
-					ERROR("Invalid send size on socket");
-
-				/* Try to send all pending messages */
-				while (pair->pending_remotes
-				       && event.data >= pair->pending_remotes->data_len) {
-					struct rte_mbuf *m = pair->pending_remotes;
-					pair->pending_remotes = m->next;
-					m->next = NULL;
-
-					void *bsd_mbuf = ff_mbuf_get(NULL, (void *)m, rte_pktmbuf_mtod(m, void *), m->data_len);
-					printf("Gonna send on %d\n", clientfd);
-					if (ff_write(pair->hostfd, bsd_mbuf, m->data_len) < 0)
-						SYSERROR("Error sending pending message");
-
-					event.data -= m->data_len;
-
-					printf("Pushed one on %d\n", clientfd);
-				}
-
-				if (!pair->pending_remotes) {
-					/* All pending sent, we can resume receiving from local */
-					pair->remote_busy = 0;
-					struct kevent kev;
-					EV_SET(&kev, clientfd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-					if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
-						SYSERROR("Error updating kevents");
-					printf("Unblocking on %d\n", clientfd);
-				} else {
-					/* Adjust expected size */
-					struct kevent kev;
-					EV_SET(&kev, clientfd, EVFILT_WRITE,
-					       EV_ADD, NOTE_LOWAT,
-					       pair->pending_remotes->data_len,
-					       NULL);
-					if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
-						SYSERROR("Error updating kevents");
-					printf("Staying blocked on %d\n", clientfd);
-				}
+		} else if (event->filter == EVFILT_WRITE) {
+			if (pconn->pending_to_remote) {
+				send_pending_to_remote(pconn, event->data);
 			} else {
 				/* Connection to remote host established */
+				pconn->status = CONN_OPEN;
+				LIST_INSERT_HEAD(&active_conns, pconn, list);
 				struct kevent kevs[2];
-				EV_SET(&kevs[0], clientfd, EVFILT_WRITE,
+				EV_SET(&kevs[0], pconn->fd, EVFILT_WRITE,
 				       EV_DELETE, 0, 0, NULL);
-				EV_SET(&kevs[1], clientfd, EVFILT_READ, EV_ADD,
-				       0, 0, NULL);
+				EV_SET(&kevs[1], pconn->fd, EVFILT_READ, EV_ADD,
+				       0, 0, pconn);
 				if (ff_kevent(kq, kevs, 2, NULL, 0, NULL) < 0)
 					SYSERROR("Error updating kevents");
-
-				pair->connected = 1;
 			}
 
 		} else {
-			printf("unknown event: %8.8X\n", event.flags);
+			ERROR("Received unknown event: %d", event->filter);
 		}
 	}
 
@@ -704,23 +752,16 @@ int loop(void *arg)
 			break;
 	}
 
-	for (int i = 0; i < MAX_CONNECTIONS; i++) {
-		if (fd_map[i].hostfd == -1 || !fd_map[i].connected
-		    || fd_map[i].remote_busy)
-			continue;
-
+	struct proxy_conn *pconn, *tmp;
+	LIST_FOREACH_SAFE(pconn, &active_conns, list, tmp) {
 		/* Read from the connection */
-		struct conn *c = fd_map[i].conn;
-		enum conn_side side = fd_map[i].local_side;
 		struct unimsg_shm_desc descs[UNIMSG_MAX_DESCS_BULK];
 		unsigned ndescs = UNIMSG_MAX_DESCS_BULK;
-		int rc;
-		rc = conn_recv(c, descs, &ndescs, side);
+		int rc = conn_recv(pconn->local_conn, descs, &ndescs,
+				   pconn->local_side);
 		if (rc) {
 			if (rc == -ECONNRESET) {
-				ff_close(fd_map[i].hostfd);
-				conn_close(c, side);
-				remove_fd_pair(fd_map, fd_map[i].hostfd);
+				close_proxy_conn(pconn);
 				continue;
 			} else if (rc == -EAGAIN) {
 				/* If rc == -EAGAIN the peer has nothing to send
@@ -734,7 +775,7 @@ int loop(void *arg)
 			}
 		}
 
-		send_to_remote(fd_map[i].hostfd, descs, ndescs);
+		send_to_remote(pconn, descs, ndescs);
 	}
 }
 
@@ -752,14 +793,19 @@ void gateway_start()
 
 	/* Create a listening socket for each public app */
 	for (unsigned i = 0; i < ARRAY_ITEMS(public_apps); i++) {
-		struct public_app *app = &public_apps[i];
+		struct proxy_conn *pconn = calloc(1, sizeof(*pconn));
+		if (!pconn)
+			SYSERROR("Error allocating proxy connection");
 
-		app->sock = ff_socket(AF_INET, SOCK_STREAM, 0);
-		if (app->sock < 0)
+		pconn->fd = ff_socket(AF_INET, SOCK_STREAM, 0);
+		if (pconn->fd < 0)
 			SYSERROR("Error creating socket");
 
+		pconn->status = CONN_LISTENING;
+		pconn->app = &public_apps[i];
+
 		int on = 1;
-		if (ff_ioctl(app->sock, FIONBIO, &on) < 0)
+		if (ff_ioctl(pconn->fd, FIONBIO, &on) < 0)
 			SYSERROR("Error setting non blocking");
 
 		struct sockaddr_in addr;
@@ -767,15 +813,16 @@ void gateway_start()
 		addr.sin_port = htons(public_apps[i].port);
 		addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-		if (ff_bind(app->sock, (struct linux_sockaddr *)&addr,
+		if (ff_bind(pconn->fd, (struct linux_sockaddr *)&addr,
 			    sizeof(addr)) < 0)
 			SYSERROR("Error binding socket");
 
-		if (ff_listen(app->sock, MAX_EVENTS) < 0)
+		if (ff_listen(pconn->fd, MAX_EVENTS) < 0)
 			SYSERROR("Error listening socket");
 
-		EV_SET(&kevSet, app->sock, EVFILT_READ, EV_ADD, 0, 0, app);
-		if (ff_kevent(kq, &kevSet, 1, NULL, 0, NULL) < 0)
+		struct kevent kev;
+		EV_SET(&kev, pconn->fd, EVFILT_READ, EV_ADD, 0, 0, pconn);
+		if (ff_kevent(kq, &kev, 1, NULL, 0, NULL) < 0)
 			SYSERROR("Error registering kevent");
 	}
 }
@@ -810,8 +857,7 @@ int main(int argc, char *argv[])
 	// if (sigaction(SIGINT, &sigact, NULL))
 	// 	SYSERROR("Error setting SIGINT handler");
 
-	/* intialize the fd_map*/
-	initialize_fd_map();
+	LIST_INIT(&active_conns);
 	gateway_start();
 
 #ifdef VANILLA_FSTACK
